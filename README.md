@@ -32,6 +32,7 @@ rtk_recovery/
 ### Запуск
 
 ```bash
+git clone https://github.com/Radmayr/rtk_recovery-.git rtk_recovery && cd rtk_recovery
 pip install -r requirements.txt
 
 cp report/settings_local.example.py report/settings_local.py   # и поправить под себя
