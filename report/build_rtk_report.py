@@ -328,7 +328,15 @@ RED = "#e34948"
 PROD = "financial_account_subtype_cd"
 
 
-from rtk_target import duty_scale    # шкала пошлины — общая с rtk_target.py
+def duty_scale(claim):
+    # имущественная пошлина, подп. 1 п. 1 ст. 333.21 НК РФ (ред. 259-ФЗ)
+    x = np.asarray(claim, dtype=float)
+    d = np.select(
+        [x <= 100_000, x <= 1_000_000, x <= 10_000_000, x <= 50_000_000],
+        [10_000.0, 10_000 + 0.05 * (x - 100_000), 55_000 + 0.03 * (x - 1_000_000),
+         325_000 + 0.01 * (x - 10_000_000)],
+        default=725_000 + 0.005 * (x - 50_000_000))
+    return np.minimum(d, 10_000_000)
 
 
 def cost(balance, share=DUTY_SHARE, overhead=OVERHEAD):
