@@ -449,11 +449,21 @@ def build_model(spec):
 
             model = joblib.load(path)
             features = list(getattr(model, "feature_name_", None) or getattr(model, "feature_names_in_", []))
+        # модель, сохранённая через collection_lab, сама знает свои признаки и сама их готовит
+        own = hasattr(model, "features_") and hasattr(model, "preparer_")
         cats = []
+        if own:
+            features, cats = list(model.features_), list(model.cat_features_)
         if spec.get("features_json"):
             meta = json.loads(Path(spec["features_json"]).read_text(encoding="utf-8"))
-            features = meta.get("features", features)
-            cats = meta.get("cat_features", [])
+            if own:
+                diff = sorted(set(meta.get("features", features)) ^ set(features))
+                if diff:
+                    print(f"Модель «{spec['name']}»: features_json не совпадает с признаками самой модели "
+                          f"({', '.join(diff[:8])}{'…' if len(diff) > 8 else ''}) — взяты признаки из модели.")
+            else:
+                features = meta.get("features", features)
+                cats = meta.get("cat_features", [])
         if not features:
             raise ValueError(f"Модель «{spec['name']}»: не удалось определить признаки — задайте features_json")
         lacking = [c for c in features if c not in source.columns and c not in base.columns]
@@ -466,11 +476,16 @@ def build_model(spec):
             raw_x = pd.DataFrame({c: (source[c].reindex(d["contract_number"]).to_numpy()
                                       if c in source.columns else d[c].to_numpy()) for c in features},
                                  index=d.index)
-            X = prepare_features(raw_x, cats)
-            out["scores"][k] = np.asarray(model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba")
-                                          else model.predict(X))
+            if own:
+                out["scores"][k] = np.asarray(model.predict(raw_x))       # подготовка — внутри модели
+            else:
+                X = prepare_features(raw_x, cats)
+                out["scores"][k] = np.asarray(model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba")
+                                              else model.predict(X))
         booster = getattr(model, "booster_", model)
-        if hasattr(booster, "feature_importance"):
+        if own:
+            out["importance"] = model.feature_importance("gain")
+        elif hasattr(booster, "feature_importance"):
             out["importance"] = pd.Series(booster.feature_importance(importance_type="gain"), index=features,
                                           dtype=float)
         out["kind"], out["desc"], out["features"] = "file", spec.get("target", MODEL_TARGET), list(features)
