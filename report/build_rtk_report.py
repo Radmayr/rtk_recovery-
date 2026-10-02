@@ -44,6 +44,7 @@ MODEL_PRODUCTS = None              # продукты для модели: None 
 RETRO_TO = None                    # договоры, включённые не позже этой даты; None — все с полными 2 годами
 OOT_FROM = "2024-01-01"            # с этой даты включения — проверочная выборка (модель её не видит)
 MIN_CONTRACTS = 100                # продукты с меньшим числом договоров на графики не выносятся
+SCORE_BUCKETS = 5                  # на сколько равных групп по оценке модели делить договоры для винтажей
 DUTY_SHARE = 0.5                   # доля имущественной пошлины: 0.5 — включение в реестр
 OVERHEAD = 0                       # ₽ на договор сверх пошлины (подготовка и подача заявления)
 
@@ -414,6 +415,29 @@ te["decile"] = pd.qcut(te["score_new"].rank(method="first", ascending=False), 10
 dec_t = te.groupby("decile", observed=False).agg(
     n=("profit", "size"), payoff=("payoff", "mean"), money=("money", "mean"), duty=("duty", "mean"),
     profit=("profit", "mean"), profit_sum=("profit", "sum"))
+# винтажи по группам оценки: проверочные договоры, равные группы от высшей оценки к низшей
+B = SCORE_BUCKETS
+BUCKETS = [f"{i} — высшая оценка" if i == 1 else f"{i} — низшая оценка" if i == B else str(i)
+           for i in range(1, B + 1)]
+te["bucket"] = pd.qcut(te["score_new"].rank(method="first", ascending=False), B, labels=BUCKETS).astype(str)
+tx_te = all_main.merge(te[["contract_number", "bucket"]], on="contract_number")
+pop_te = te[["contract_number", "rtk_balance", "bucket"]]
+bucket_curves, _ = cl.eda.vintage_by_segment(tx_te, "bucket", segments=BUCKETS, population=pop_te,
+                                             step=7, **KW)
+bucket_conv, _ = cl.eda.vintage_by_segment(tx_te[tx_te["transaction_amt"].fillna(1) > 0], "bucket",
+                                           segments=BUCKETS, population=pop_te, step=7, **KW)
+payers = set(tx_all.loc[tx_all["transaction_amt"] > 0, "contract_number"])
+te["paid"] = te["contract_number"].isin(payers)
+by_bucket = te.groupby("bucket").agg(
+    n=("money", "size"), balance=("rtk_balance", "sum"), money=("money", "sum"), duty=("duty", "sum"),
+    paid=("paid", "mean"), payoff=("payoff", "mean"), score_min=("score_new", "min"),
+    score_max=("score_new", "max")).reindex(BUCKETS)
+by_bucket["recovery"] = by_bucket["money"] / by_bucket["balance"]
+by_bucket["money_avg"] = by_bucket["money"] / by_bucket["n"]
+by_bucket["duty_avg"] = by_bucket["duty"] / by_bucket["n"]
+BUCKET_COLORS = seq_colors(B)[::-1]                    # высшая оценка — самый тёмный
+te_recovery = te["money"].sum() / te["rtk_balance"].sum()
+
 importance = model_new.feature_importance("gain")
 importance = (importance / importance.sum()).sort_values(ascending=False)
 
@@ -1053,6 +1077,86 @@ display(Markdown(f\'\'\'
 > В среднем в плюс выходит {pos_groups} из 10 групп — включаться стоит по верхней части списка, а не
 > по большинству. Качество на проверке (AUC {dec(auc["проверка"], 2)}) ниже, чем на
 > обучении ({dec(auc["обучение"], 2)}): модель умеренной силы, и главный резерв роста — новые признаки.
+\'\'\'))
+""")
+
+md("""
+### Поступления по группам оценки модели
+
+Проверка «на деньгах»: если модель работает, договоры с высокой оценкой должны возвращать больше.
+Проверочные договоры (модель их не видела) разбиты на равные по числу группы по оценке; для каждой
+группы построен свой винтаж — так же, как в части I, со своей базой (договоры и долг группы).
+""")
+code("""
+fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.09,
+                    subplot_titles=["накопленная доля от долга", "доля договоров с платежом"])
+for j, (table, col) in enumerate([(bucket_curves, "cum_share_of_balance"), (bucket_conv, "cum_share_clients")], start=1):
+    for colr, b in zip(BUCKET_COLORS, BUCKETS, strict=True):
+        g = table[table["sample"] == b]
+        fig.add_scatter(x=g["day"], y=g[col], mode="lines", name=b, legendgroup=b, showlegend=j == 1,
+                        line={"color": colr, "width": 2.5 if b == BUCKETS[0] else 2}, row=1, col=j,
+                        hovertemplate=b + ": %{y:.1%}<extra></extra>")
+top_b, low_b = by_bucket.iloc[0], by_bucket.iloc[-1]
+layout(fig, f"Группа с высшей оценкой возвращает {pct(top_b['recovery'])} долга, с низшей — {pct(low_b['recovery'])}",
+       f"винтажи по группам оценки модели, договоры, включённые {P_TEST} (темнее — выше оценка)",
+       height=460, top=120, hovermode="x unified", legend={"title": {"text": "группа по оценке"}})
+fig.update_yaxes(tickformat=".0%", rangemode="tozero")
+fig.update_xaxes(title_text="месяцев после включения в РТК", range=[0, H + 12], **MONTH_TICKS)
+fig.update_annotations(font={"size": 13, "color": INK2})
+fig
+""")
+code("""
+fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.07, column_widths=[0.29, 0.29, 0.42], subplot_titles=[
+    "доля возврата за 2 года", "доля договоров с платежом", "на договор, ₽: поступления и пошлина"])
+x = [b.split(" — ")[0] for b in BUCKETS]
+for j, (col, d) in enumerate([("recovery", 1), ("paid", 0)], start=1):
+    fig.add_bar(x=x, y=by_bucket[col], row=1, col=j, marker={"color": BUCKET_COLORS, "cornerradius": 4},
+                text=[pct(v, d) for v in by_bucket[col]], textposition="outside", cliponaxis=False,
+                textfont={"color": INK, "size": 12}, showlegend=False, customdata=by_bucket["n"],
+                hovertemplate="группа %{x}: %{text}<br>договоров: %{customdata:,}<extra></extra>")
+fig.add_bar(x=x, y=by_bucket["money_avg"], row=1, col=3, name="поступления", marker={"color": BLUE, "cornerradius": 4},
+            text=[num(v) for v in by_bucket["money_avg"]], textposition="outside", cliponaxis=False,
+            textfont={"color": INK, "size": 11}, hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>поступления</extra>")
+fig.add_bar(x=x, y=by_bucket["duty_avg"], row=1, col=3, name="пошлина", marker={"color": ORANGE, "cornerradius": 4},
+            text=[num(v) for v in by_bucket["duty_avg"]], textposition="outside", cliponaxis=False,
+            textfont={"color": INK, "size": 11}, hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>пошлина</extra>")
+layout(fig, f"Итог за 2 года по группам оценки: от {pct(top_b['recovery'])} до {pct(low_b['recovery'])} долга",
+       "группа 1 — высшая оценка модели; в среднем по проверочным договорам — " + pct(te_recovery),
+       height=430, top=120, barmode="group", bargap=0.28,
+       legend={"orientation": "h", "y": -0.24, "x": 1, "xanchor": "right"})
+fig.update_yaxes(showticklabels=False, showgrid=False)
+fig.update_xaxes(title_text="группа по оценке")
+fig.update_annotations(font={"size": 13, "color": INK2})
+fig
+""")
+code("""
+t = by_bucket
+display(pd.DataFrame({
+    "договоров": t["n"].map(num), "оценка модели": [f"{dec(a, 3)} – {dec(b, 3)}" for a, b in zip(t["score_min"], t["score_max"], strict=True)],
+    "долг, млн ₽": (t["balance"] / 1e6).map(lambda v: dec(v, 0)),
+    "поступления, млн ₽": (t["money"] / 1e6).map(lambda v: dec(v, 1)),
+    "доля возврата": t["recovery"].map(pct), "с платежом": t["paid"].map(lambda v: pct(v, 0)),
+    "окупили пошлину": t["payoff"].map(lambda v: pct(v, 0)),
+    "результат, млн ₽": (t["money"] - t["duty"]).map(lambda v: signed(v).replace(" млн ₽", "")),
+}).rename_axis("группа по оценке"))
+rec = by_bucket["recovery"].to_numpy()
+ordered = bool((np.diff(rec) <= 0).all())
+order_txt = ("Группы выстроились строго по оценке: чем она выше, тем больше возврат."
+             if ordered else
+             "Порядок групп соблюдается не везде: " + ", ".join(
+                 f"группа {i + 2} возвращает больше группы {i + 1}" for i in np.where(np.diff(rec) > 0)[0]) + ".")
+wide = bucket_curves.pivot(index="day", columns="sample", values="cum_share_of_balance")[BUCKETS]
+late = wide[wide.index >= 183]
+leads = bool((late[BUCKETS[0]] >= late.drop(columns=BUCKETS[0]).max(axis=1)).all())
+lead_txt = (" Начиная с полугода верхняя группа опережает все остальные на всём сроке наблюдения."
+            if leads else "")
+ratio = top_b["recovery"] / low_b["recovery"] if low_b["recovery"] > 0 else np.nan
+ratio_txt = f" — в {dec(ratio, 1)} раза больше" if ratio == ratio else ""
+display(Markdown(f\'\'\'
+> **Вывод.** {order_txt} Группа с высшей оценкой возвращает {pct(top_b["recovery"])} долга против
+> {pct(low_b["recovery"])} у группы с низшей{ratio_txt}; платят в ней {pct(top_b["paid"], 0)} договоров
+> против {pct(low_b["paid"], 0)}. На верхнюю группу ({pct(1 / B, 0)} договоров) приходится
+> {pct(top_b["money"] / by_bucket["money"].sum(), 0)} всех поступлений проверочного периода.{lead_txt}
 \'\'\'))
 """)
 
