@@ -44,7 +44,7 @@ MODEL_PRODUCTS = None              # продукты для модели: None 
 RETRO_TO = None                    # договоры, включённые не позже этой даты; None — все с полными 2 годами
 OOT_FROM = "2024-01-01"            # с этой даты включения — проверочная выборка (модель её не видит)
 MIN_CONTRACTS = 100                # продукты с меньшим числом договоров на графики не выносятся
-SCORE_BUCKETS = 5                  # на сколько равных групп по оценке модели делить договоры для винтажей
+SCORE_BUCKETS = 10                 # на сколько равных групп по оценке модели делить договоры для винтажей
 DUTY_SHARE = 0.5                   # доля имущественной пошлины: 0.5 — включение в реестр
 OVERHEAD = 0                       # ₽ на договор сверх пошлины (подготовка и подача заявления)
 
@@ -1099,14 +1099,16 @@ for j, (table, col) in enumerate([(bucket_curves, "cum_share_of_balance"), (buck
 top_b, low_b = by_bucket.iloc[0], by_bucket.iloc[-1]
 layout(fig, f"Группа с высшей оценкой возвращает {pct(top_b['recovery'])} долга, с низшей — {pct(low_b['recovery'])}",
        f"винтажи по группам оценки модели, договоры, включённые {P_TEST} (темнее — выше оценка)",
-       height=460, top=120, hovermode="x unified", legend={"title": {"text": "группа по оценке"}})
+       height=460 if B <= 6 else 540, top=120, hovermode="x unified",
+       legend={"title": {"text": "группа по оценке"}, "tracegroupgap": 2})
 fig.update_yaxes(tickformat=".0%", rangemode="tozero")
 fig.update_xaxes(title_text="месяцев после включения в РТК", range=[0, H + 12], **MONTH_TICKS)
 fig.update_annotations(font={"size": 13, "color": INK2})
 fig
 """)
 code("""
-fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.07, column_widths=[0.29, 0.29, 0.42], subplot_titles=[
+fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06,
+                    column_widths=[0.29, 0.29, 0.42] if B <= 6 else [0.36, 0.36, 0.28], subplot_titles=[
     "доля возврата за 2 года", "доля договоров с платежом", "на договор, ₽: поступления и пошлина"])
 x = [b.split(" — ")[0] for b in BUCKETS]
 for j, (col, d) in enumerate([("recovery", 1), ("paid", 0)], start=1):
@@ -1115,14 +1117,15 @@ for j, (col, d) in enumerate([("recovery", 1), ("paid", 0)], start=1):
                 textfont={"color": INK, "size": 12}, showlegend=False, customdata=by_bucket["n"],
                 hovertemplate="группа %{x}: %{text}<br>договоров: %{customdata:,}<extra></extra>")
 fig.add_bar(x=x, y=by_bucket["money_avg"], row=1, col=3, name="поступления", marker={"color": BLUE, "cornerradius": 4},
-            text=[num(v) for v in by_bucket["money_avg"]], textposition="outside", cliponaxis=False,
+            text=[num(v) if B <= 6 else "" for v in by_bucket["money_avg"]], textposition="outside", cliponaxis=False,
             textfont={"color": INK, "size": 11}, hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>поступления</extra>")
 fig.add_bar(x=x, y=by_bucket["duty_avg"], row=1, col=3, name="пошлина", marker={"color": ORANGE, "cornerradius": 4},
-            text=[num(v) for v in by_bucket["duty_avg"]], textposition="outside", cliponaxis=False,
+            text=[num(v) if B <= 6 else "" for v in by_bucket["duty_avg"]], textposition="outside", cliponaxis=False,
             textfont={"color": INK, "size": 11}, hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>пошлина</extra>")
 layout(fig, f"Итог за 2 года по группам оценки: от {pct(top_b['recovery'])} до {pct(low_b['recovery'])} долга",
        "группа 1 — высшая оценка модели; в среднем по проверочным договорам — " + pct(te_recovery),
-       height=430, top=120, barmode="group", bargap=0.28,
+       height=430, top=120, barmode="group", bargap=0.28 if B <= 6 else 0.18,
+       uniformtext={"minsize": 11, "mode": "show"},
        legend={"orientation": "h", "y": -0.24, "x": 1, "xanchor": "right"})
 fig.update_yaxes(showticklabels=False, showgrid=False)
 fig.update_xaxes(title_text="группа по оценке")
