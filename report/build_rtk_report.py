@@ -44,7 +44,9 @@ MODEL_PRODUCTS = None              # продукты для модели: None 
 RETRO_TO = None                    # договоры, включённые не позже этой даты; None — все с полными 2 годами
 OOT_FROM = "2024-01-01"            # с этой даты включения — проверочная выборка (модель её не видит)
 MIN_CONTRACTS = 100                # продукты с меньшим числом договоров на графики не выносятся
-COMPARE_SHARE = None               # доля включений, при которой сравниваются модели; None — порог основной модели
+CUTOFF = "best"                    # как выбирается порог отбора: "best" — максимум результата основной модели
+                                   # на проверочных договорах; "early" — максимум на более ранних договорах
+COMPARE_SHARE = None               # задать долю включений вручную (например 0.2); None — по правилу CUTOFF
 SCORE_BUCKETS = 10                 # на сколько равных групп по оценке модели делить договоры для винтажей
 BANKRUPTCY_COL = "bankruptcy_date" # дата банкротства в таблице транзакций; нет колонки — блок о сроках пропускается
 
@@ -554,11 +556,39 @@ def top_mask(score, k):
     return mask
 
 
-own_mask_new, thr_new, share_val_new = policy(va["score_new"].to_numpy(), p_va, te["score_new"].to_numpy())
-# сравнение моделей — при одной и той же доле включений: по умолчанию та, что даёт порог основной модели
-K_COMMON = int(round(len(te) * COMPARE_SHARE)) if COMPARE_SHARE else int(own_mask_new.sum())
-mask_new = top_mask(te["score_new"].to_numpy(), K_COMMON) if COMPARE_SHARE else own_mask_new
+def best_k(score, profit):
+    # сколько договоров с наибольшей оценкой даёт максимум накопленного результата
+    order = np.argsort(-np.asarray(score), kind="stable")
+    return int(np.argmax(np.concatenate([[0.0], np.cumsum(profit[order])])))
+
+
+def choose(score_va, profit_va, score_te, profit_te):
+    # отбор по правилу CUTOFF: максимум на проверочных договорах либо порог с более ранних
+    if CUTOFF == "best":
+        return top_mask(score_te, best_k(score_te, profit_te))
+    return policy(score_va, profit_va, score_te)[0]
+
+
+if CUTOFF not in ("best", "early"):
+    raise ValueError('CUTOFF должен быть "best" или "early"')
+early_mask_new, thr_new, share_val_new = policy(va["score_new"].to_numpy(), p_va, te["score_new"].to_numpy())
+# порог выбирается по основной модели; остальные модели сравниваются при той же доле включений
+if COMPARE_SHARE:
+    mask_new = top_mask(te["score_new"].to_numpy(), int(round(len(te) * COMPARE_SHARE)))
+    CUTOFF_HOW = f"задан вручную: {COMPARE_SHARE:.0%} договоров с наибольшей оценкой"
+elif CUTOFF == "best":
+    mask_new = choose(None, None, te["score_new"].to_numpy(), p_te)
+    CUTOFF_HOW = ("выбран по основной модели в точке, где накопленный результат (поступления минус пошлина) "
+                  "на проверочных договорах максимален")
+else:
+    mask_new = early_mask_new
+    CUTOFF_HOW = ("выбран по основной модели на более ранних договорах — в точке, где накопленный результат "
+                  "там максимален, — и применён к проверочным")
+K_COMMON = int(mask_new.sum())
 SHARE_COMMON = K_COMMON / len(te)
+IN_SAMPLE = CUTOFF == "best" and not COMPARE_SHARE
+CUTOFF_CAVEAT = (" Порог подобран на тех же договорах, на которых считается результат, поэтому результат — "
+                 "оценка сверху: на новых договорах при этом пороге он будет ниже." if IN_SAMPLE else "")
 res = {"all": summary(np.ones(len(te), bool)), "new": summary(mask_new), "oracle": summary(p_te > 0)}
 T = len(te)
 per_1000 = res["new"]["profit"] / T * 1000
@@ -614,8 +644,9 @@ def captured(score, share):
 SHARE_GRID = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
 for m in models:
     sv, st = m["scores"]["va"], m["scores"]["te"]
-    m["own_mask"], m["thr"], _ = policy(sv, p_va, st)          # свой порог — только для справки
+    m["own_mask"], m["thr"], _ = policy(sv, p_va, st)          # порог с ранних договоров — для справки
     m["own_res"] = summary(m["own_mask"])
+    m["best_res"] = summary(top_mask(st, best_k(st, p_te)))    # собственный максимум модели — для справки
     m["mask"] = mask_new if m is main else top_mask(st, K_COMMON)   # одинаковое число включений у всех
     m["res"] = summary(m["mask"])
     m["grid"] = {q: p_te[top_mask(st, int(round(T * q)))].sum() for q in SHARE_GRID}
@@ -742,10 +773,10 @@ for name, share, overhead in SCENARIOS:
     pr = {k: (d["money"] - cost(d["rtk_balance"], share, overhead)).to_numpy()
           for k, d in (("tr", tr), ("va", va), ("te", te))}
     if not RETRAIN:                                # модель не переобучается — меняется только порог
-        msk, _, _ = policy(va["score_new"].to_numpy(), pr["va"], te["score_new"].to_numpy())
+        msk = choose(va["score_new"].to_numpy(), pr["va"], te["score_new"].to_numpy(), pr["te"])
     else:
         m = fit((pr["tr"] > 0).astype(int), (pr["va"] > 0).astype(int))
-        msk, _, _ = policy(m.predict(va[FEATURES]), pr["va"], m.predict(te[FEATURES]))
+        msk = choose(m.predict(va[FEATURES]), pr["va"], m.predict(te[FEATURES]), pr["te"])
     sens[name] = {"all": pr["te"].sum(), "new": pr["te"][msk].sum(), "share": msk.mean()}
 sens = pd.DataFrame(sens).T
 
@@ -766,8 +797,8 @@ if MULTI and RETRAIN:
     r_tr, r_va, r_te = [(d["product"] == PRODUCT).to_numpy() for d in (tr, va, te)]
     solo_features = [c for c in FEATURES if c != PROD]
     m_solo = fit(tr["payoff"][r_tr], va["payoff"][r_va], r_tr, r_va, solo_features)
-    msk, _, _ = policy(m_solo.predict(va[r_va][solo_features]), p_va[r_va],
-                       m_solo.predict(te[r_te][solo_features]))
+    msk = choose(m_solo.predict(va[r_va][solo_features]), p_va[r_va],
+                 m_solo.predict(te[r_te][solo_features]), p_te[r_te])
     solo = {"solo": p_te[r_te][msk].sum(), "joint": p_te[r_te & mask_new].sum(),
             "all": p_te[r_te].sum(), "n": int(r_te.sum())}
 
@@ -1364,8 +1395,7 @@ else:
 **Что предсказывает.** Основная модель — «{MODEL_NAME}» ({how}). Она оценивает вероятность того, что
 {main["desc"]}. Ниже проверяется, насколько её оценка упорядочивает договоры по окупаемости пошлины.
 
-**Как проверена.** Договоры, включённые {P_TRAIN}, используются для выбора порога отбора; результат
-считается на договорах, включённых {P_TEST}. Чтобы проверка была честной, проверочный период должен
+**Как проверена.** Результат считается на договорах, включённых {P_TEST}; порог отбора {CUTOFF_HOW}. Чтобы проверка была честной, проверочный период должен
 начинаться не раньше, чем заканчивается период обучения модели (настройка `OOT_FROM`).
 '''
 if other_models:
@@ -1461,20 +1491,22 @@ code("""
 show_buckets(main)
 """)
 
-md("""
+code("""
+early = main["own_res"]
+display(Markdown(f'''
 ## 8. Как отбираем договоры и сколько это даёт
 
 **Правило.** Для каждого нового договора модель считает оценку. Договоры упорядочиваются по оценке,
-включаемся по тем, у кого она выше порога. Порог выбран на более ранних договорах — в точке,
-где суммарный результат (поступления минус пошлина) максимален, — и затем проверен на более поздних
-договорах, которых модель не видела.
+включаемся по тем, у кого она выше порога. Порог {CUTOFF_HOW}: включаемся по {pct(SHARE_COMMON, 0)}
+договоров.{CUTOFF_CAVEAT}
 
-**Сравнение моделей — при одинаковой доле включений.** Порог подбирается по основной модели (или
-задаётся настройкой `COMPARE_SHARE`), и каждая модель отбирает одно и то же число договоров с
-наибольшей оценкой. Так разница между моделями показывает качество ранжирования, а не случайно
-разные пороги.
-""")
-code("""
+Для справки: порог, подобранный только на более ранних договорах, даёт включение по
+{pct(early["share"], 0)} договоров и результат {signed(early["profit"])}.
+
+**Сравнение моделей — при одинаковой доле включений.** Каждая модель отбирает одно и то же число
+договоров с наибольшей оценкой, поэтому разница между моделями показывает качество ранжирования,
+а не разные пороги.
+'''))
 fig = go.Figure()
 for i, m in enumerate(models):
     name, colr, mask = m["name"], MODEL_COLORS[m["name"]], m["mask"]
@@ -1599,7 +1631,7 @@ else:
 code("""
 display(Markdown("### Если затраты окажутся выше\\n\\nПошлина — не единственный расход: возможны затраты на "
                  "подготовку и подачу заявления. " +
-                 ("Модель та же; под каждый сценарий заново подобран только порог отбора." if not RETRAIN else
+                 ("Модель та же; под каждый сценарий заново подобран только порог отбора (по тому же правилу)." if not RETRAIN else
                   "Под каждый сценарий модель обучена заново («окупит ли договор эти затраты»), порог "
                   "подобран тем же способом.")))
 display(pd.DataFrame({
@@ -1628,8 +1660,8 @@ if other_models:
 
 Все модели сравниваются при одной и той же доле включений — {pct(SHARE_COMMON, 0)} договоров с наибольшей
 оценкой ({num(K_COMMON)} из {num(T)} договоров, включённых {P_TEST}). Основная модель — «{MODEL_NAME}».
-Строки «при своём пороге» — справочно: порог каждой модели, подобранный отдельно на ранних договорах;
-он зависит от случайных колебаний, поэтому по нему модели не сравниваются.
+Порог {CUTOFF_HOW}. Справочные строки: «свой максимум» — лучшая точка каждой модели на проверочных
+договорах; «порог с ранних договоров» — порог каждой модели, подобранный отдельно на более ранних договорах.
 \'\'\'))
     display(pd.DataFrame({
         m["name"]: {
@@ -1644,8 +1676,10 @@ if other_models:
             "доля денег в верхних 10 % по оценке": pct(m["top10"], 0),
             "доля денег в верхних 20 % по оценке": pct(m["top20"], 0),
             "совпадение отбора с основной моделью": pct(m["overlap"], 0),
-            "при своём пороге: доля включений": pct(m["own_res"]["share"], 0),
-            "при своём пороге: результат, млн ₽": signed(m["own_res"]["profit"]).replace(" млн ₽", ""),
+            "свой максимум: доля включений": pct(m["best_res"]["share"], 0),
+            "свой максимум: результат, млн ₽": signed(m["best_res"]["profit"]).replace(" млн ₽", ""),
+            "порог с ранних договоров: доля включений": pct(m["own_res"]["share"], 0),
+            "порог с ранних договоров: результат, млн ₽": signed(m["own_res"]["profit"]).replace(" млн ₽", ""),
         } for m in models}))
 """)
 code("""
@@ -1725,8 +1759,8 @@ display(Markdown(f'''
 - **Пошлина** — по действующему тарифу (50 % имущественной пошлины, ст. 333.21 НК РФ) от суммы
   долга на дату включения. **Результат** — поступления за 2 года минус пошлина.
 - **Другие продукты** — тот же расчёт поступлений и пошлины. {NO_FEATURES_NOTE}
-- **Модель** — {model_note} Порог отбора выбран на части более ранних договоров, проверочная
-  выборка в выборе не участвовала.
+- **Модель** — {model_note}
+- **Порог отбора** {CUTOFF_HOW}.{CUTOFF_CAVEAT}
 - **Интервалы «с вероятностью 90 %»** — бутстреп по договорам проверочной выборки (1 000 повторов).
 
 **Что важно помнить**
