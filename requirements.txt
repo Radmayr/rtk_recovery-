@@ -1,0 +1,4 @@
+collection_lab @ git+https://github.com/Radmayr/collection_lab.git
+nbformat>=5.0
+nbconvert>=7.0
+ipykernel
