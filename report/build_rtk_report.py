@@ -47,7 +47,13 @@ MIN_CONTRACTS = 100                # продукты с меньшим числ
 SCORE_BUCKETS = 10                 # на сколько равных групп по оценке модели делить договоры для винтажей
 BANKRUPTCY_COL = "bankruptcy_date" # дата банкротства в таблице транзакций; нет колонки — блок о сроках пропускается
 
-# Модель. По умолчанию отчёт обучает её сам. Чтобы применить готовую, задайте одно из двух:
+# Модели. По умолчанию отчёт сам обучает две: «окупит пошлину» и «вернёт > 5 % долга».
+# Свой набор задаётся списком MODELS — первая модель основная, остальные сравниваются с ней:
+#   {"name": "v1", "path": "model.pkl", "features_json": "features.json", "target": "что предсказывает"}
+#   {"name": "v2", "score_col": "score_v2", "target": "..."}        — оценка уже лежит колонкой в признаках
+#   {"name": "окупит пошлину", "train": "payoff"}                   — обучить в отчёте («payoff» или «share5»)
+MODELS = None
+# Короткая запись для одной готовой модели (то же, что MODELS из одного элемента):
 MODEL_PATH = None                  # файл обученной модели: .pkl (joblib, есть predict_proba) или .txt (LightGBM)
 SCORE_COL = None                   # либо колонка с уже посчитанной оценкой в таблице признаков
 MODEL_FEATURES_JSON = None         # features.json модели ("features", "cat_features"); None — взять из модели
@@ -401,71 +407,111 @@ def fit(y_tr, y_va, rows_tr=None, rows_va=None, features=None):
                  cat_features=[c for c in cat_cols if c in features])
 
 
-EXTERNAL = MODEL_PATH is not None or SCORE_COL is not None   # готовая модель: в отчёте не обучаем
-HAS_OLD = not EXTERNAL                                        # сравнение с текущим таргетом — только при обучении
-ext_model, ext_importance = None, None
-if SCORE_COL is not None:
-    require(base, [SCORE_COL], "признаки")
-    FEATURES = [c for c in FEATURES if c != SCORE_COL]
-    for part in (tr, va, te):
-        part["score_new"] = pd.to_numeric(part[SCORE_COL], errors="coerce")
-        if part["score_new"].isna().any():
-            raise ValueError(f"В колонке {SCORE_COL!r} есть пустые оценки")
-elif MODEL_PATH is not None:
-    import json
-
-    if str(MODEL_PATH).endswith(".txt"):
-        import lightgbm as lgb
-
-        ext_model = lgb.Booster(model_file=str(MODEL_PATH))
-        ext_features = ext_model.feature_name()
+# ---------- модели: готовые (файл или колонка с оценкой) и обучаемые в отчёте
+TRAIN_TARGETS = {"payoff": ("payoff", "поступления за 2 года превысят пошлину"),
+                 "share5": ("old_target", "договор вернёт больше 5 % долга за 2 года")}
+if MODELS is None:
+    if SCORE_COL is not None:
+        MODELS = [{"name": "готовая модель", "score_col": SCORE_COL, "target": MODEL_TARGET}]
+    elif MODEL_PATH is not None:
+        MODELS = [{"name": "готовая модель", "path": MODEL_PATH, "features_json": MODEL_FEATURES_JSON,
+                   "target": MODEL_TARGET}]
     else:
-        import joblib
+        MODELS = [{"name": "новая: окупит пошлину", "train": "payoff"},
+                  {"name": "текущая: вернёт > 5 % долга", "train": "share5"}]
+if len({m["name"] for m in MODELS}) != len(MODELS):
+    raise ValueError("В MODELS повторяются имена моделей (name) — они должны быть разными")
+score_cols = [m["score_col"] for m in MODELS if m.get("score_col")]
+require(base, score_cols, "признаки")
+FEATURES = [c for c in FEATURES if c not in score_cols]         # готовые оценки — не признаки
+PARTS = {"tr": tr, "va": va, "te": te}
+source = agg.set_index("contract_number")                        # исходные значения, до приведения типов
 
-        ext_model = joblib.load(MODEL_PATH)
-        ext_features = list(getattr(ext_model, "feature_name_", None)
-                            or getattr(ext_model, "feature_names_in_", []))
-    ext_cat = []
-    if MODEL_FEATURES_JSON is not None:
-        meta = json.loads(Path(MODEL_FEATURES_JSON).read_text(encoding="utf-8"))
-        ext_features = meta.get("features", ext_features)
-        ext_cat = meta.get("cat_features", [])
-    if not ext_features:
-        raise ValueError("Не удалось определить признаки модели — задайте MODEL_FEATURES_JSON")
-    source = agg.set_index("contract_number")              # исходные значения, до приведения типов
-    lacking = [c for c in ext_features if c not in source.columns and c not in base.columns]
-    if lacking:
-        raise ValueError(f"В таблице признаков нет колонок, нужных модели: {', '.join(lacking)}")
-    if not ext_cat:
-        ext_cat = [c for c in ext_features if c in source.columns and source[c].dtype == object]
-    for part in (tr, va, te):
-        raw_x = pd.DataFrame({c: (source[c].reindex(part["contract_number"]).to_numpy()
-                                  if c in source.columns else part[c].to_numpy())
-                              for c in ext_features}, index=part.index)
-        X = prepare_features(raw_x, ext_cat)
-        part["score_new"] = (ext_model.predict_proba(X)[:, 1] if hasattr(ext_model, "predict_proba")
-                             else ext_model.predict(X))
-    FEATURES = list(ext_features)
-    booster = getattr(ext_model, "booster_", ext_model)
-    if hasattr(booster, "feature_importance"):
-        ext_importance = pd.Series(booster.feature_importance(importance_type="gain"), index=ext_features,
-                                   dtype=float)
+
+def build_model(spec):
+    out = {"name": spec["name"], "features": None, "importance": None, "retrain": False}
+    if spec.get("score_col"):
+        col = spec["score_col"]
+        out["scores"] = {k: pd.to_numeric(d[col], errors="coerce").to_numpy() for k, d in PARTS.items()}
+        out["kind"], out["desc"] = "col", spec.get("target", MODEL_TARGET)
+        out["note"] = f"оценка из колонки `{col}`"
+    elif spec.get("path"):
+        import json
+
+        path = str(spec["path"])
+        if path.endswith(".txt"):
+            import lightgbm as lgb
+
+            model = lgb.Booster(model_file=path)
+            features = model.feature_name()
+        else:
+            import joblib
+
+            model = joblib.load(path)
+            features = list(getattr(model, "feature_name_", None) or getattr(model, "feature_names_in_", []))
+        cats = []
+        if spec.get("features_json"):
+            meta = json.loads(Path(spec["features_json"]).read_text(encoding="utf-8"))
+            features = meta.get("features", features)
+            cats = meta.get("cat_features", [])
+        if not features:
+            raise ValueError(f"Модель «{spec['name']}»: не удалось определить признаки — задайте features_json")
+        lacking = [c for c in features if c not in source.columns and c not in base.columns]
+        if lacking:
+            raise ValueError(f"Модель «{spec['name']}»: в таблице признаков нет колонок {', '.join(lacking)}")
+        if not cats:
+            cats = [c for c in features if c in source.columns and source[c].dtype == object]
+        out["scores"] = {}
+        for k, d in PARTS.items():
+            raw_x = pd.DataFrame({c: (source[c].reindex(d["contract_number"]).to_numpy()
+                                      if c in source.columns else d[c].to_numpy()) for c in features},
+                                 index=d.index)
+            X = prepare_features(raw_x, cats)
+            out["scores"][k] = np.asarray(model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba")
+                                          else model.predict(X))
+        booster = getattr(model, "booster_", model)
+        if hasattr(booster, "feature_importance"):
+            out["importance"] = pd.Series(booster.feature_importance(importance_type="gain"), index=features,
+                                          dtype=float)
+        out["kind"], out["desc"], out["features"] = "file", spec.get("target", MODEL_TARGET), list(features)
+        out["note"] = f"готовая модель, {len(features)} признаков"
+    elif spec.get("train"):
+        if spec["train"] not in TRAIN_TARGETS:
+            raise ValueError(f"Модель «{spec['name']}»: train должен быть одним из {list(TRAIN_TARGETS)}")
+        ycol, desc = TRAIN_TARGETS[spec["train"]]
+        model = fit(tr[ycol], va[ycol])
+        out["scores"] = {k: np.asarray(model.predict(d[FEATURES])) for k, d in PARTS.items()}
+        out["importance"] = model.feature_importance("gain")
+        out["kind"], out["desc"], out["features"] = "train", spec.get("target", desc), list(FEATURES)
+        out["retrain"] = spec["train"] == "payoff"
+        out["note"] = f"обучена в отчёте, {len(FEATURES)} признаков"
+    else:
+        raise ValueError(f"Модель «{spec['name']}»: задайте path, score_col или train")
+    for k, v in out["scores"].items():
+        if np.isnan(v).any():
+            raise ValueError(f"Модель «{spec['name']}»: есть пустые оценки ({k})")
+    return out
+
+
+models = [build_model(spec) for spec in MODELS]
+main = models[0]                                   # основная модель: по ней порог, группы, результат
+for k, d in PARTS.items():
+    d["score_new"] = main["scores"][k]
+EXTERNAL = main["kind"] != "train"                 # основная модель готовая — в отчёте не обучалась
+RETRAIN = main["retrain"]                          # под сценарии затрат можно переобучать
+if main["features"]:
+    FEATURES_MAIN = main["features"]
 else:
-    model_new = fit(tr["payoff"], va["payoff"])
-    model_old = fit(tr["old_target"], va["old_target"])
-    for part in (tr, va, te):
-        part["score_new"] = model_new.predict(part[FEATURES])
-        part["score_old"] = model_old.predict(part[FEATURES])
+    FEATURES_MAIN = []
+MODEL_COLORS = {m["name"]: CATEGORICAL[i % len(CATEGORICAL)] for i, m in enumerate(models)}
 
-# подписи: что за модель и как она названа в тексте
+# подписи: как основная модель названа в тексте
 P1 = "ранние договоры" if EXTERNAL else "обучение"
-if EXTERNAL:
-    MODEL_NAME, MODEL_GEN = "готовая модель", "готовой моделью"
-    MODEL_DESC = (f"Применяется готовая модель, в отчёте она не обучается. Она оценивает вероятность того, "
-                  f"что {MODEL_TARGET}.")
-else:
-    MODEL_NAME, MODEL_GEN = "новая модель", "новой моделью"
-    MODEL_DESC = "Она оценивает вероятность того, что поступления за 2 года превысят пошлину."
+MODEL_NAME = main["name"]
+MODEL_GEN = f"моделью «{MODEL_NAME}»"
+MODEL_DESC = (f"Основная модель — «{MODEL_NAME}»"
+              + (", готовая: в отчёте она не обучается." if EXTERNAL else ", обучена в отчёте.")
+              + f" Она оценивает вероятность того, что {main['desc']}.")
 
 
 def policy(score_va, profit_va, score_te):
@@ -487,9 +533,6 @@ def summary(mask):
 p_va, p_te = va["profit"].to_numpy(), te["profit"].to_numpy()
 mask_new, thr_new, share_val_new = policy(va["score_new"].to_numpy(), p_va, te["score_new"].to_numpy())
 res = {"all": summary(np.ones(len(te), bool)), "new": summary(mask_new), "oracle": summary(p_te > 0)}
-if HAS_OLD:
-    mask_old, thr_old, _ = policy(va["score_old"].to_numpy(), p_va, te["score_old"].to_numpy())
-    res["old"] = summary(mask_old)
 T = len(te)
 per_1000 = res["new"]["profit"] / T * 1000
 per_1000_txt = (mln(per_1000, 1) if abs(per_1000) >= 1e6 else f"{num(per_1000 / 1000)} тыс ₽").replace("-", "−")
@@ -499,42 +542,141 @@ rng = np.random.default_rng(0)
 idx = rng.integers(0, T, size=(1000, T))
 boot_new = (p_te[idx] * mask_new[idx]).sum(axis=1)
 ci_new = np.percentile(boot_new, [5, 95])
-if HAS_OLD:
-    ci_diff = np.percentile(boot_new - (p_te[idx] * mask_old[idx]).sum(axis=1), [5, 95])
-OLD_TXT = (f" Текущая модель (таргет «вернули больше 5 % долга») дала бы {signed(res['old']['profit'])}."
-           if HAS_OLD else "")
 
 # качество
 auc = {name: cl.metrics.roc_auc(d["payoff"], d["score_new"]) for name, d in
        ((P1, tr), ("настройка порога", va), ("проверка", te))}
+FEATURES_SHOWN = main["features"] or []
 te["decile"] = pd.qcut(te["score_new"].rank(method="first", ascending=False), 10, labels=range(1, 11))
 dec_t = te.groupby("decile", observed=False).agg(
     n=("profit", "size"), payoff=("payoff", "mean"), money=("money", "mean"), duty=("duty", "mean"),
     profit=("profit", "mean"), profit_sum=("profit", "sum"))
-# винтажи по группам оценки: проверочные договоры, равные группы от высшей оценки к низшей
+# группы по оценке: проверочные договоры, равные группы от высшей оценки к низшей — для любой модели
 B = SCORE_BUCKETS
 BUCKETS = [f"{i} — высшая оценка" if i == 1 else f"{i} — низшая оценка" if i == B else str(i)
            for i in range(1, B + 1)]
-te["bucket"] = pd.qcut(te["score_new"].rank(method="first", ascending=False), B, labels=BUCKETS).astype(str)
-tx_te = all_main.merge(te[["contract_number", "bucket"]], on="contract_number")
-pop_te = te[["contract_number", "rtk_balance", "bucket"]]
-bucket_curves, _ = cl.eda.vintage_by_segment(tx_te, "bucket", segments=BUCKETS, population=pop_te,
-                                             step=7, **KW)
-bucket_conv, _ = cl.eda.vintage_by_segment(tx_te[tx_te["transaction_amt"].fillna(1) > 0], "bucket",
-                                           segments=BUCKETS, population=pop_te, step=7, **KW)
+BUCKET_COLORS = seq_colors(B)[::-1]                    # высшая оценка — самый тёмный
 payers = set(tx_all.loc[tx_all["transaction_amt"] > 0, "contract_number"])
 te["paid"] = te["contract_number"].isin(payers)
-by_bucket = te.groupby("bucket").agg(
-    n=("money", "size"), balance=("rtk_balance", "sum"), money=("money", "sum"), duty=("duty", "sum"),
-    paid=("paid", "mean"), payoff=("payoff", "mean"), score_min=("score_new", "min"),
-    score_max=("score_new", "max")).reindex(BUCKETS)
-by_bucket["recovery"] = by_bucket["money"] / by_bucket["balance"]
-by_bucket["money_avg"] = by_bucket["money"] / by_bucket["n"]
-by_bucket["duty_avg"] = by_bucket["duty"] / by_bucket["n"]
-BUCKET_COLORS = seq_colors(B)[::-1]                    # высшая оценка — самый тёмный
 te_recovery = te["money"].sum() / te["rtk_balance"].sum()
+money_te = te["money"].clip(lower=0).to_numpy()
 
-importance = ext_importance if EXTERNAL else model_new.feature_importance("gain")
+
+def bucket_stats(score):
+    b = pd.qcut(pd.Series(score, index=te.index).rank(method="first", ascending=False), B,
+                labels=BUCKETS).astype(str)
+    pop = te[["contract_number", "rtk_balance"]].assign(bucket=b)
+    txb = all_main.merge(pop[["contract_number", "bucket"]], on="contract_number")
+    curves, _ = cl.eda.vintage_by_segment(txb, "bucket", segments=BUCKETS, population=pop, step=7, **KW)
+    conv, _ = cl.eda.vintage_by_segment(txb[txb["transaction_amt"].fillna(1) > 0], "bucket",
+                                        segments=BUCKETS, population=pop, step=7, **KW)
+    t = te.assign(bucket=b, score=score).groupby("bucket").agg(
+        n=("money", "size"), balance=("rtk_balance", "sum"), money=("money", "sum"), duty=("duty", "sum"),
+        paid=("paid", "mean"), payoff=("payoff", "mean"), score_min=("score", "min"),
+        score_max=("score", "max")).reindex(BUCKETS)
+    t["recovery"] = t["money"] / t["balance"]
+    t["money_avg"], t["duty_avg"] = t["money"] / t["n"], t["duty"] / t["n"]
+    return t, curves, conv
+
+
+def captured(score, share):
+    k = int(round(T * share))
+    return money_te[np.argsort(-score, kind="stable")[:k]].sum() / money_te.sum()
+
+
+for m in models:
+    sv, st = m["scores"]["va"], m["scores"]["te"]
+    m["mask"], m["thr"], _ = policy(sv, p_va, st)
+    m["res"] = summary(m["mask"])
+    m["boot"] = (p_te[idx] * m["mask"][idx]).sum(axis=1)
+    m["ci"] = np.percentile(m["boot"], [5, 95])
+    m["auc"] = cl.metrics.roc_auc(te["payoff"], st)
+    m["auc_paid"] = cl.metrics.roc_auc(te["paid"].astype(int), st)
+    m["top10"], m["top20"] = captured(st, 0.1), captured(st, 0.2)
+    m["by_bucket"], m["curves"], m["conv"] = bucket_stats(st)
+    m["overlap"] = (m["mask"] & main["mask"]).sum() / max(main["mask"].sum(), 1)
+    m["diff_ci"] = np.percentile(main["boot"] - m["boot"], [5, 95])
+other_models = models[1:]
+by_bucket, bucket_curves, bucket_conv = main["by_bucket"], main["curves"], main["conv"]
+OTHERS_TXT = ("" if not other_models else " Для сравнения: " + "; ".join(
+    f"«{m['name']}» — {signed(m['res']['profit'])}" for m in other_models) + ".")
+
+
+def show_buckets(m):
+    # винтажи и итог по группам оценки одной модели
+    t, curves, conv = m["by_bucket"], m["curves"], m["conv"]
+    top_b, low_b = t.iloc[0], t.iloc[-1]
+    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.09,
+                        subplot_titles=["накопленная доля от долга", "доля договоров с платежом"])
+    for j, (table, col) in enumerate([(curves, "cum_share_of_balance"), (conv, "cum_share_clients")], start=1):
+        for colr, b in zip(BUCKET_COLORS, BUCKETS, strict=True):
+            g = table[table["sample"] == b]
+            fig.add_scatter(x=g["day"], y=g[col], mode="lines", name=b, legendgroup=b, showlegend=j == 1,
+                            line={"color": colr, "width": 2.5 if b == BUCKETS[0] else 2}, row=1, col=j,
+                            hovertemplate=b + ": %{y:.1%}<extra></extra>")
+    layout(fig, f"«{m['name']}»: группа с высшей оценкой возвращает {pct(top_b['recovery'])} долга, с низшей — {pct(low_b['recovery'])}",
+           f"винтажи по группам оценки модели, договоры, включённые {P_TEST} (темнее — выше оценка)",
+           height=460 if B <= 6 else 540, top=120, hovermode="x unified",
+           legend={"title": {"text": "группа по оценке"}, "tracegroupgap": 2})
+    fig.update_yaxes(tickformat=".0%", rangemode="tozero")
+    fig.update_xaxes(title_text="месяцев после включения в РТК", range=[0, H + 12], **MONTH_TICKS)
+    fig.update_annotations(font={"size": 13, "color": INK2})
+    fig.show()
+
+    fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06,
+                        column_widths=[0.29, 0.29, 0.42] if B <= 6 else [0.36, 0.36, 0.28], subplot_titles=[
+        "доля возврата за 2 года", "доля договоров с платежом", "на договор, ₽: поступления и пошлина"])
+    x = [b.split(" — ")[0] for b in BUCKETS]
+    for j, (col, d) in enumerate([("recovery", 1), ("paid", 0)], start=1):
+        fig.add_bar(x=x, y=t[col], row=1, col=j, marker={"color": BUCKET_COLORS, "cornerradius": 4},
+                    text=[pct(v, d) for v in t[col]], textposition="outside", cliponaxis=False,
+                    textfont={"color": INK, "size": 12}, showlegend=False, customdata=t["n"],
+                    hovertemplate="группа %{x}: %{text}<br>договоров: %{customdata:,}<extra></extra>")
+    for name, col, colr in [("поступления", "money_avg", BLUE), ("пошлина", "duty_avg", ORANGE)]:
+        fig.add_bar(x=x, y=t[col], row=1, col=3, name=name, marker={"color": colr, "cornerradius": 4},
+                    text=[num(v) if B <= 6 else "" for v in t[col]], textposition="outside", cliponaxis=False,
+                    textfont={"color": INK, "size": 11},
+                    hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>" + name + "</extra>")
+    layout(fig, f"«{m['name']}»: итог за 2 года по группам оценки — от {pct(top_b['recovery'])} до {pct(low_b['recovery'])} долга",
+           "группа 1 — высшая оценка модели; в среднем по проверочным договорам — " + pct(te_recovery),
+           height=430, top=120, barmode="group", bargap=0.28 if B <= 6 else 0.18,
+           uniformtext={"minsize": 11, "mode": "show"},
+           legend={"orientation": "h", "y": -0.24, "x": 1, "xanchor": "right"})
+    fig.update_yaxes(showticklabels=False, showgrid=False)
+    fig.update_xaxes(title_text="группа по оценке")
+    fig.update_annotations(font={"size": 13, "color": INK2})
+    fig.show()
+
+    display(pd.DataFrame({
+        "договоров": t["n"].map(num),
+        "оценка модели": [f"{dec(a, 3)} – {dec(b, 3)}" for a, b in zip(t["score_min"], t["score_max"], strict=True)],
+        "долг, млн ₽": (t["balance"] / 1e6).map(lambda v: dec(v, 0)),
+        "поступления, млн ₽": (t["money"] / 1e6).map(lambda v: dec(v, 1)),
+        "доля возврата": t["recovery"].map(pct), "с платежом": t["paid"].map(lambda v: pct(v, 0)),
+        "окупили пошлину": t["payoff"].map(lambda v: pct(v, 0)),
+        "результат, млн ₽": (t["money"] - t["duty"]).map(lambda v: signed(v).replace(" млн ₽", "")),
+    }).rename_axis("группа по оценке"))
+    rec = t["recovery"].to_numpy()
+    breaks = np.where(np.diff(rec) > 0)[0]
+    order_txt = ("Группы выстроились строго по оценке: чем она выше, тем больше возврат." if len(breaks) == 0 else
+                 "Порядок групп соблюдается не везде: " + ", ".join(
+                     f"группа {i + 2} возвращает больше группы {i + 1}" for i in breaks) + ".")
+    ratio = top_b["recovery"] / low_b["recovery"] if low_b["recovery"] > 0 else np.nan
+    ratio_txt = f" — в {dec(ratio, 1)} раза больше" if ratio == ratio else ""
+    wide = curves.pivot(index="day", columns="sample", values="cum_share_of_balance")[BUCKETS]
+    late = wide[wide.index >= 183]
+    leads = bool((late[BUCKETS[0]] >= late.drop(columns=BUCKETS[0]).max(axis=1)).all())
+    lead_txt = " Начиная с полугода верхняя группа опережает все остальные на всём сроке наблюдения." if leads else ""
+    display(Markdown(
+        f"> **Вывод по модели «{m['name']}».** {order_txt} Группа с высшей оценкой возвращает "
+        f"{pct(top_b['recovery'])} долга против {pct(low_b['recovery'])} у группы с низшей{ratio_txt}; платят в ней "
+        f"{pct(top_b['paid'], 0)} договоров против {pct(low_b['paid'], 0)}. На верхнюю группу "
+        f"({pct(1 / B, 0)} договоров) приходится {pct(top_b['money'] / t['money'].sum(), 0)} всех поступлений "
+        f"проверочного периода.{lead_txt}"))
+
+
+
+importance = main["importance"]
 if importance is not None and importance.sum() > 0:
     importance = (importance / importance.sum()).sort_values(ascending=False)
 else:
@@ -567,7 +709,7 @@ for name, share, overhead in SCENARIOS:
         continue
     pr = {k: (d["money"] - cost(d["rtk_balance"], share, overhead)).to_numpy()
           for k, d in (("tr", tr), ("va", va), ("te", te))}
-    if EXTERNAL:                                   # готовая модель не переобучается — меняется только порог
+    if not RETRAIN:                                # модель не переобучается — меняется только порог
         msk, _, _ = policy(va["score_new"].to_numpy(), pr["va"], te["score_new"].to_numpy())
     else:
         m = fit((pr["tr"] > 0).astype(int), (pr["va"] > 0).astype(int))
@@ -588,7 +730,7 @@ by_product["share"] = by_product["take"] / by_product["n"]
 
 # общая модель против модели только по основному продукту (на его проверочных договорах)
 solo = None
-if MULTI and not EXTERNAL:
+if MULTI and RETRAIN:
     r_tr, r_va, r_te = [(d["product"] == PRODUCT).to_numpy() for d in (tr, va, te)]
     solo_features = [c for c in FEATURES if c != PROD]
     m_solo = fit(tr["payoff"][r_tr], va["payoff"][r_va], r_tr, r_va, solo_features)
@@ -646,7 +788,7 @@ display(Markdown(f'''
 
 **Содержание.** Часть I — что происходит после включения: сколько денег приходит, когда и от кого
 (разделы 1–5). Часть II — экономика включения с учётом пошлины, модель отбора договоров и её
-эффект в деньгах (разделы 6–8). В конце — как считали и что важно помнить.
+эффект в деньгах, сравнение моделей (разделы 6–9). В конце — как считали и что важно помнить.
 '''))
 
 tiles = [
@@ -712,7 +854,7 @@ display(Markdown(f'''
    {pct(res["all"]["payoff"], 0)} в среднем.
 8. **Результат на договорах проверочного периода: {signed(res["new"]["profit"])}** вместо
    {signed(res["all"]["profit"], 0)} — это {per_1000_txt} на каждую 1 000 рассмотренных договоров.
-  {OLD_TXT}
+  {OTHERS_TXT}
 9. **Откуда эффект и насколько он устойчив.** {MARGIN_TXT} При дополнительных 2 000 ₽ расходов
    на подачу результат отбора — {signed(sens["new"].iloc[1])} (вместо {signed(res["new"]["profit"])}).
    Оценка — сверху: все поступления считаются результатом включения.
@@ -1170,31 +1312,33 @@ display(Markdown(f\'\'\'
 """)
 
 code("""
-if EXTERNAL:
-    intro = f'''
-## 7. Модель: какие договоры окупят пошлину
-
-**Что предсказывает.** В отчёте применяется готовая модель — здесь она не обучается. Модель оценивает
-вероятность того, что {MODEL_TARGET}. Ниже проверяется, насколько её оценка упорядочивает договоры по
-окупаемости пошлины.
-
-**Как проверена.** Договоры, включённые {P_TRAIN}, используются только для выбора порога отбора;
-результат считается на договорах, включённых {P_TEST}. Чтобы проверка была честной, проверочный
-период должен начинаться не раньше, чем заканчивается период обучения модели (настройка `OOT_FROM`).
-'''
-else:
+if RETRAIN:
     intro = '''
 ## 7. Модель: какие договоры окупят пошлину
 
 **Что предсказывает.** Вероятность того, что поступления по договору за 2 года после включения
 превысят пошлину по нему. Это прямо условие решения «включаться или нет», поэтому отбор по такой
-оценке — отбор по окупаемости. Текущая модель предсказывает другое событие — «вернули больше 5 %
-долга» — и пошлину не учитывает.
+оценке — отбор по окупаемости.
 
 **На чём обучена и как проверена.** Модель учится на более ранних договорах и проверяется на более
 поздних, которых не видела (периоды — в таблице ниже), — так же, как будет работать в жизни:
 решение по новым договорам на опыте прошлых.
 '''
+else:
+    how = ("готовая, в отчёте она не обучается" if EXTERNAL else "обучена в отчёте на более ранних договорах")
+    intro = f'''
+## 7. Модель: какие договоры окупят пошлину
+
+**Что предсказывает.** Основная модель — «{MODEL_NAME}» ({how}). Она оценивает вероятность того, что
+{main["desc"]}. Ниже проверяется, насколько её оценка упорядочивает договоры по окупаемости пошлины.
+
+**Как проверена.** Договоры, включённые {P_TRAIN}, используются для выбора порога отбора; результат
+считается на договорах, включённых {P_TEST}. Чтобы проверка была честной, проверочный период должен
+начинаться не раньше, чем заканчивается период обучения модели (настройка `OOT_FROM`).
+'''
+if other_models:
+    intro += ("\\nВсего моделей в отчёте — " + str(len(models)) + ": " + ", ".join(f"«{m['name']}»" for m in models)
+              + ". Разделы 7 и 8 — по основной; сравнение всех моделей — в разделе 9.\\n")
 display(Markdown(intro))
 parts = [(P1, tr), ("настройка порога", va), ("проверка", te)]
 display(pd.DataFrame({
@@ -1203,10 +1347,11 @@ display(pd.DataFrame({
     "окупили пошлину": [pct(d["payoff"].mean()) for _, d in parts],
     "качество ранжирования (AUC)": [dec(auc[k], 3) for k, _ in parts],
 }, index=pd.Index([k for k, _ in parts], name="выборка")))
-feat_txt = (f"Оценка взята из колонки `{SCORE_COL}` таблицы признаков." if SCORE_COL is not None else
-            f"Признаков у модели — {len(FEATURES)}: {', '.join(FEATURES[:12])}{'…' if len(FEATURES) > 12 else ''}."
-            if EXTERNAL else
-            f"Признаков — {len(FEATURES)}: сумма долга, просрочки по договору, имущество (автомобили, "
+F = FEATURES_SHOWN
+feat_txt = ("Оценка модели взята готовой из таблицы признаков." if main["kind"] == "col" else
+            f"Признаков у модели — {len(F)}: {', '.join(F[:12])}{'…' if len(F) > 12 else ''}."
+            if main["kind"] == "file" else
+            f"Признаков — {len(F)}: сумма долга, просрочки по договору, имущество (автомобили, "
             "недвижимость), кредиты в других банках, анкетные данные. Алгоритм — градиентный бустинг (LightGBM).")
 display(Markdown(f\'\'\'
 {feat_txt}
@@ -1281,79 +1426,7 @@ md("""
 группы построен свой винтаж — так же, как в части I, со своей базой (договоры и долг группы).
 """)
 code("""
-fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.09,
-                    subplot_titles=["накопленная доля от долга", "доля договоров с платежом"])
-for j, (table, col) in enumerate([(bucket_curves, "cum_share_of_balance"), (bucket_conv, "cum_share_clients")], start=1):
-    for colr, b in zip(BUCKET_COLORS, BUCKETS, strict=True):
-        g = table[table["sample"] == b]
-        fig.add_scatter(x=g["day"], y=g[col], mode="lines", name=b, legendgroup=b, showlegend=j == 1,
-                        line={"color": colr, "width": 2.5 if b == BUCKETS[0] else 2}, row=1, col=j,
-                        hovertemplate=b + ": %{y:.1%}<extra></extra>")
-top_b, low_b = by_bucket.iloc[0], by_bucket.iloc[-1]
-layout(fig, f"Группа с высшей оценкой возвращает {pct(top_b['recovery'])} долга, с низшей — {pct(low_b['recovery'])}",
-       f"винтажи по группам оценки модели, договоры, включённые {P_TEST} (темнее — выше оценка)",
-       height=460 if B <= 6 else 540, top=120, hovermode="x unified",
-       legend={"title": {"text": "группа по оценке"}, "tracegroupgap": 2})
-fig.update_yaxes(tickformat=".0%", rangemode="tozero")
-fig.update_xaxes(title_text="месяцев после включения в РТК", range=[0, H + 12], **MONTH_TICKS)
-fig.update_annotations(font={"size": 13, "color": INK2})
-fig
-""")
-code("""
-fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06,
-                    column_widths=[0.29, 0.29, 0.42] if B <= 6 else [0.36, 0.36, 0.28], subplot_titles=[
-    "доля возврата за 2 года", "доля договоров с платежом", "на договор, ₽: поступления и пошлина"])
-x = [b.split(" — ")[0] for b in BUCKETS]
-for j, (col, d) in enumerate([("recovery", 1), ("paid", 0)], start=1):
-    fig.add_bar(x=x, y=by_bucket[col], row=1, col=j, marker={"color": BUCKET_COLORS, "cornerradius": 4},
-                text=[pct(v, d) for v in by_bucket[col]], textposition="outside", cliponaxis=False,
-                textfont={"color": INK, "size": 12}, showlegend=False, customdata=by_bucket["n"],
-                hovertemplate="группа %{x}: %{text}<br>договоров: %{customdata:,}<extra></extra>")
-fig.add_bar(x=x, y=by_bucket["money_avg"], row=1, col=3, name="поступления", marker={"color": BLUE, "cornerradius": 4},
-            text=[num(v) if B <= 6 else "" for v in by_bucket["money_avg"]], textposition="outside", cliponaxis=False,
-            textfont={"color": INK, "size": 11}, hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>поступления</extra>")
-fig.add_bar(x=x, y=by_bucket["duty_avg"], row=1, col=3, name="пошлина", marker={"color": ORANGE, "cornerradius": 4},
-            text=[num(v) if B <= 6 else "" for v in by_bucket["duty_avg"]], textposition="outside", cliponaxis=False,
-            textfont={"color": INK, "size": 11}, hovertemplate="группа %{x}: %{y:,.0f} ₽<extra>пошлина</extra>")
-layout(fig, f"Итог за 2 года по группам оценки: от {pct(top_b['recovery'])} до {pct(low_b['recovery'])} долга",
-       "группа 1 — высшая оценка модели; в среднем по проверочным договорам — " + pct(te_recovery),
-       height=430, top=120, barmode="group", bargap=0.28 if B <= 6 else 0.18,
-       uniformtext={"minsize": 11, "mode": "show"},
-       legend={"orientation": "h", "y": -0.24, "x": 1, "xanchor": "right"})
-fig.update_yaxes(showticklabels=False, showgrid=False)
-fig.update_xaxes(title_text="группа по оценке")
-fig.update_annotations(font={"size": 13, "color": INK2})
-fig
-""")
-code("""
-t = by_bucket
-display(pd.DataFrame({
-    "договоров": t["n"].map(num), "оценка модели": [f"{dec(a, 3)} – {dec(b, 3)}" for a, b in zip(t["score_min"], t["score_max"], strict=True)],
-    "долг, млн ₽": (t["balance"] / 1e6).map(lambda v: dec(v, 0)),
-    "поступления, млн ₽": (t["money"] / 1e6).map(lambda v: dec(v, 1)),
-    "доля возврата": t["recovery"].map(pct), "с платежом": t["paid"].map(lambda v: pct(v, 0)),
-    "окупили пошлину": t["payoff"].map(lambda v: pct(v, 0)),
-    "результат, млн ₽": (t["money"] - t["duty"]).map(lambda v: signed(v).replace(" млн ₽", "")),
-}).rename_axis("группа по оценке"))
-rec = by_bucket["recovery"].to_numpy()
-ordered = bool((np.diff(rec) <= 0).all())
-order_txt = ("Группы выстроились строго по оценке: чем она выше, тем больше возврат."
-             if ordered else
-             "Порядок групп соблюдается не везде: " + ", ".join(
-                 f"группа {i + 2} возвращает больше группы {i + 1}" for i in np.where(np.diff(rec) > 0)[0]) + ".")
-wide = bucket_curves.pivot(index="day", columns="sample", values="cum_share_of_balance")[BUCKETS]
-late = wide[wide.index >= 183]
-leads = bool((late[BUCKETS[0]] >= late.drop(columns=BUCKETS[0]).max(axis=1)).all())
-lead_txt = (" Начиная с полугода верхняя группа опережает все остальные на всём сроке наблюдения."
-            if leads else "")
-ratio = top_b["recovery"] / low_b["recovery"] if low_b["recovery"] > 0 else np.nan
-ratio_txt = f" — в {dec(ratio, 1)} раза больше" if ratio == ratio else ""
-display(Markdown(f\'\'\'
-> **Вывод.** {order_txt} Группа с высшей оценкой возвращает {pct(top_b["recovery"])} долга против
-> {pct(low_b["recovery"])} у группы с низшей{ratio_txt}; платят в ней {pct(top_b["paid"], 0)} договоров
-> против {pct(low_b["paid"], 0)}. На верхнюю группу ({pct(1 / B, 0)} договоров) приходится
-> {pct(top_b["money"] / by_bucket["money"].sum(), 0)} всех поступлений проверочного периода.{lead_txt}
-\'\'\'))
+show_buckets(main)
 """)
 
 md("""
@@ -1366,18 +1439,18 @@ md("""
 """)
 code("""
 fig = go.Figure()
-curves = [(MODEL_NAME if EXTERNAL else "новая модель: «окупит пошлину»", "score_new", BLUE, mask_new)]
-if HAS_OLD:
-    curves.append(("текущая модель: «вернёт > 5 % долга»", "score_old", ORANGE, mask_old))
-for name, col, colr, mask in curves:
-    xs, ys = cum_curve(te[col].to_numpy())
-    fig.add_scatter(x=xs, y=ys, mode="lines", name=name, line={"color": colr, "width": 2.5},
+for i, m in enumerate(models):
+    name, colr, mask = m["name"], MODEL_COLORS[m["name"]], m["mask"]
+    xs, ys = cum_curve(m["scores"]["te"])
+    fig.add_scatter(x=xs, y=ys, mode="lines", name=name, line={"color": colr, "width": 2.5 if i == 0 else 2},
                     hovertemplate="%{x:.0%} договоров: %{y:.1f} млн ₽<extra>" + name + "</extra>")
     k = int(mask.sum())
+    if k == 0:
+        continue
     fig.add_scatter(x=[xs[k - 1]], y=[ys[k - 1]], mode="markers", showlegend=False,
                     marker={"color": colr, "size": 11, "line": {"color": "white", "width": 2}}, hoverinfo="skip")
-    up = col == "score_new"
-    fig.add_annotation(x=xs[k - 1], y=ys[k - 1], ax=50 if up else 70, ay=-42 if up else 58,
+    up = i % 2 == 0
+    fig.add_annotation(x=xs[k - 1], y=ys[k - 1], ax=50 if up else 70, ay=(-42 - 14 * (i // 2)) if up else (58 + 14 * (i // 2)),
                        text=f"порог: {pct(mask.mean(), 0)} договоров, {signed(ys[k - 1] * 1e6)}",
                        showarrow=True, arrowhead=0, arrowwidth=1, arrowcolor=INK2, standoff=8,
                        font={"color": INK, "size": 12}, bgcolor="white")
@@ -1397,12 +1470,11 @@ fig.update_yaxes(title_text="млн ₽", range=[y_lo - 1, ys_new.max() + 3])
 fig
 """)
 code("""
-names = {"all": "включаться по всем"}
-if HAS_OLD:
-    names["old"] = "отбор текущей моделью"
-names["new"] = f"отбор {MODEL_GEN}"
-vals = [res[k]["profit"] / 1e6 for k in names]
-fig = go.Figure(go.Bar(x=list(names.values()), y=vals, width=0.5,
+rows = {"включаться по всем": res["all"]}
+rows.update({m["name"]: m["res"] for m in models})
+names = list(rows)
+vals = [rows[k]["profit"] / 1e6 for k in names]
+fig = go.Figure(go.Bar(x=names, y=vals, width=0.5,
                        marker={"color": [BLUE if v >= 0 else RED for v in vals], "cornerradius": 4},
                        text=[signed(v * 1e6) for v in vals], textposition="outside", cliponaxis=False,
                        textfont={"color": INK, "size": 14}, hovertemplate="%{x}: %{y:.1f} млн ₽<extra></extra>"))
@@ -1414,19 +1486,20 @@ fig
 """)
 code("""
 display(pd.DataFrame({
-    names[k]: {"включаемся по договорам": num(res[k]["n"]), "доля договоров": pct(res[k]["share"], 0),
-               "из них окупают пошлину": pct(res[k]["payoff"], 0),
-               "уплачено пошлины, млн ₽": dec(res[k]["duty"] / 1e6, 1),
-               "поступления за 2 года, млн ₽": dec(res[k]["money"] / 1e6, 1),
-               "результат, млн ₽": signed(res[k]["profit"]).replace(" млн ₽", ""),
-               "на 1 ₽ пошлины возвращается, ₽": dec(res[k]["money"] / res[k]["duty"], 2)}
-    for k in names}))
+    k: {"включаемся по договорам": num(r["n"]), "доля договоров": pct(r["share"], 0),
+        "из них окупают пошлину": "—" if r["n"] == 0 else pct(r["payoff"], 0),
+        "уплачено пошлины, млн ₽": dec(r["duty"] / 1e6, 1),
+        "поступления за 2 года, млн ₽": dec(r["money"] / 1e6, 1),
+        "результат, млн ₽": signed(r["profit"]).replace(" млн ₽", ""),
+        "на 1 ₽ пошлины возвращается, ₽": "—" if r["duty"] == 0 else dec(r["money"] / r["duty"], 2)}
+    for k, r in rows.items()}))
+second = other_models[0] if other_models else None
 show_tiles([
     (signed(res["new"]["profit"]), f"результат отбора {MODEL_GEN}",
      f"с вероятностью 90 % — от {signed(ci_new[0])} до {signed(ci_new[1])}"),
     (per_1000_txt, "на 1 000 рассмотренных договоров", "при потоке и качестве договоров как в проверочном периоде"),
-    ((signed(res["new"]["profit"] - res["old"]["profit"]), "лучше текущей модели",
-      f"с вероятностью 90 % — от {signed(ci_diff[0])} до {signed(ci_diff[1])}") if HAS_OLD else
+    ((signed(res["new"]["profit"] - second["res"]["profit"]), f"разница с моделью «{second['name']}»",
+      f"с вероятностью 90 % — от {signed(second['diff_ci'][0])} до {signed(second['diff_ci'][1])}") if second else
      (pct(res["new"]["share"], 0), "договоров проходят отбор",
       f"из них окупают пошлину {pct(res['new']['payoff'], 0)}")),
     (signed(res["oracle"]["profit"], 0), "потолок: безошибочный отбор",
@@ -1485,7 +1558,7 @@ else:
 code("""
 display(Markdown("### Если затраты окажутся выше\\n\\nПошлина — не единственный расход: возможны затраты на "
                  "подготовку и подачу заявления. " +
-                 ("Модель та же; под каждый сценарий заново подобран только порог отбора." if EXTERNAL else
+                 ("Модель та же; под каждый сценарий заново подобран только порог отбора." if not RETRAIN else
                   "Под каждый сценарий модель обучена заново («окупит ли договор эти затраты»), порог "
                   "подобран тем же способом.")))
 display(pd.DataFrame({
@@ -1497,7 +1570,7 @@ worst = sens["new"].iloc[1:]
 display(Markdown(f\'\'\'
 > **Вывод.** На договорах проверочного периода отбор {MODEL_GEN} даёт {signed(res["new"]["profit"])}
 > ({per_1000_txt} на 1 000 рассмотренных договоров) против {signed(res["all"]["profit"], 0)} при
-> включении по всем.{OLD_TXT} {MARGIN_TXT}
+> включении по всем.{OTHERS_TXT} {MARGIN_TXT}
 > Среди отобранных пошлину окупают {pct(res["new"]["payoff"], 0)} договоров: результат делают
 > немногие договоры с крупными поступлениями, поэтому он колеблется (интервал выше).
 > При более высоких затратах результат отбора — от {signed(worst.min())} до {signed(worst.max())}.
@@ -1506,18 +1579,84 @@ display(Markdown(f\'\'\'
 \'\'\'))
 """)
 
+# ------------------------------------------------------------------ 9. сравнение моделей
+code("""
+if other_models:
+    display(Markdown(f\'\'\'
+## 9. Сравнение моделей
+
+Все модели проверены одинаково: порог отбора выбран на более ранних договорах, результат посчитан на
+{num(T)} договорах, включённых {P_TEST}. Основная модель — «{MODEL_NAME}».
+\'\'\'))
+    display(pd.DataFrame({
+        m["name"]: {
+            "что предсказывает": m["desc"], "откуда": m["note"].replace("`", ""),
+            "AUC: окупит ли пошлину": dec(m["auc"], 3), "AUC: будет ли платёж": dec(m["auc_paid"], 3),
+            "включаемся по договорам": pct(m["res"]["share"], 0),
+            "из них окупают пошлину": "—" if m["res"]["n"] == 0 else pct(m["res"]["payoff"], 0),
+            "результат, млн ₽": signed(m["res"]["profit"]).replace(" млн ₽", ""),
+            "результат с вероятностью 90 %, млн ₽": f"{signed(m['ci'][0])} … {signed(m['ci'][1])}".replace(" млн ₽", ""),
+            "возврат в верхней группе": pct(m["by_bucket"]["recovery"].iloc[0]),
+            "возврат в нижней группе": pct(m["by_bucket"]["recovery"].iloc[-1]),
+            "доля денег в верхних 10 % по оценке": pct(m["top10"], 0),
+            "доля денег в верхних 20 % по оценке": pct(m["top20"], 0),
+            "совпадение отбора с основной моделью": pct(m["overlap"], 0),
+        } for m in models}))
+""")
+code("""
+if other_models:
+    x = [b.split(" — ")[0] for b in BUCKETS]
+    fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.07, subplot_titles=[
+        "доля возврата за 2 года", "доля договоров с платежом", "доля договоров, окупивших пошлину"])
+    for j, col in enumerate(["recovery", "paid", "payoff"], start=1):
+        for i, m in enumerate(models):
+            fig.add_scatter(x=x, y=m["by_bucket"][col], mode="lines+markers", name=m["name"], legendgroup=m["name"],
+                            showlegend=j == 1, row=1, col=j,
+                            line={"color": MODEL_COLORS[m["name"]], "width": 2.5 if i == 0 else 2},
+                            marker={"size": 8, "line": {"color": "white", "width": 2}},
+                            hovertemplate="группа %{x}: %{y:.1%}<extra>" + m["name"] + "</extra>")
+    layout(fig, "Чем круче линия, тем лучше модель отделяет хорошие договоры от плохих",
+           f"итог за 2 года по {B} группам оценки каждой модели: 1 — высшая оценка",
+           height=450, top=120, hovermode="x unified", legend={"orientation": "h", "y": -0.22, "x": 0})
+    fig.update_yaxes(tickformat=".0%", rangemode="tozero")
+    fig.update_xaxes(title_text="группа по оценке")
+    fig.update_annotations(font={"size": 13, "color": INK2})
+    fig.show()
+""")
+code("""
+if other_models:
+    best = max(models, key=lambda m: m["res"]["profit"])
+    lines = []
+    for m in other_models:
+        d = main["res"]["profit"] - m["res"]["profit"]
+        lo, hi = m["diff_ci"]
+        sure = ("разница устойчива" if lo > 0 or hi < 0 else "разница в пределах случайных колебаний")
+        lines.append(f"«{MODEL_NAME}» против «{m['name']}»: {signed(d)} (с вероятностью 90 % — от {signed(lo)} "
+                     f"до {signed(hi)}; {sure}); отбор совпадает на {pct(m['overlap'], 0)}")
+    steep = max(models, key=lambda m: m["by_bucket"]["recovery"].iloc[0] / max(m["by_bucket"]["recovery"].iloc[-1], 1e-9))
+    display(Markdown(
+        f"> **Вывод.** Лучший результат на проверочных договорах — у модели «{best['name']}»: "
+        f"{signed(best['res']['profit'])}. " + ". ".join(lines) + ". "
+        f"Сильнее всего верхнюю и нижнюю группы разводит модель «{steep['name']}»: "
+        f"{pct(steep['by_bucket']['recovery'].iloc[0])} против {pct(steep['by_bucket']['recovery'].iloc[-1])} долга."))
+    for m in other_models:
+        display(Markdown(f"### Группы по оценке: «{m['name']}»"))
+        show_buckets(m)
+""")
+
 # ------------------------------------------------------------------ методика
 code("""
 neg = tx.loc[tx["transaction_amt"] < 0, "transaction_amt"].sum()
-if EXTERNAL:
-    model_note = (f"готовая, в отчёте не обучалась; предсказывает, что {MODEL_TARGET}. Результат считается "
-                  f"на договорах, включённых с {te['rtk_send_date'].min():%d.%m.%Y}.")
-    proto_note = ("Готовая модель применена как есть. Если проверочный период пересекается с периодом её "
-                  "обучения, результат завышен — начало проверки (`OOT_FROM`) должно быть не раньше конца обучения.")
-else:
-    model_note = (f"LightGBM, {len(FEATURES)} признаков на дату включения; обучение — договоры до "
-                  f"{tr['rtk_send_date'].max():%d.%m.%Y}, проверка — с {te['rtk_send_date'].min():%d.%m.%Y}.")
-    proto_note = "Модель в отчёте — рабочий прототип: параметры не подбирались, отбор признаков не проводился."
+model_note = ("; ".join(f"«{m['name']}» — {m['note']}, предсказывает, что {m['desc']}" for m in models)
+              + f". Результат считается на договорах, включённых с {te['rtk_send_date'].min():%d.%m.%Y}.")
+notes = []
+if any(m["kind"] != "train" for m in models):
+    notes.append("Готовые модели применены как есть. Если проверочный период пересекается с периодом их "
+                 "обучения, результат завышен — начало проверки (`OOT_FROM`) должно быть не раньше конца обучения.")
+if any(m["kind"] == "train" for m in models):
+    notes.append("Модели, обученные в отчёте, — рабочие прототипы: параметры не подбирались, отбор "
+                 "признаков не проводился.")
+proto_note = " ".join(notes)
 late = df.loc[df["transaction_amt"].notna() & (df["tx_days"] > H), "transaction_amt"].sum()
 display(Markdown(f'''
 ## Как считали

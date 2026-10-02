@@ -25,11 +25,14 @@ def load_query(sql):
     return tf.Greenplum(tf.ApiClient(conf)).gp_to_df(sql, gp_service="vrcl")
 
 
-# --- готовая модель вместо обучения в отчёте (по умолчанию отчёт обучает модель сам)
-# MODEL_PATH = "/workdir/RTK_model/models/v_1/lgbm_final.pkl"
-# MODEL_FEATURES_JSON = "/workdir/RTK_model/logs/v_1/features.json"
-# SCORE_COL = "score"    # либо готовая оценка колонкой в таблице признаков
-# MODEL_TARGET = "договор вернёт больше 5 % долга за 2 года"
+# --- свои модели (по умолчанию отчёт обучает две сам). Первая — основная, остальные сравниваются с ней
+# MODELS = [
+#     {"name": "v1", "path": "/workdir/RTK_model/models/v_1/lgbm_final.pkl",
+#      "features_json": "/workdir/RTK_model/logs/v_1/features.json",
+#      "target": "договор вернёт больше 5 % долга за 2 года"},
+#     {"name": "v2", "score_col": "score_v2", "target": "договор вернёт больше 5 % долга за 2 года"},
+#     {"name": "окупит пошлину", "train": "payoff"},      # обучить в отчёте ("payoff" или "share5")
+# ]
 
 # --- что считать
 PRODUCT = "PHX"          # продукт для подробного разбора
