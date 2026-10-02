@@ -44,6 +44,7 @@ MODEL_PRODUCTS = None              # продукты для модели: None 
 RETRO_TO = None                    # договоры, включённые не позже этой даты; None — все с полными 2 годами
 OOT_FROM = "2024-01-01"            # с этой даты включения — проверочная выборка (модель её не видит)
 MIN_CONTRACTS = 100                # продукты с меньшим числом договоров на графики не выносятся
+COMPARE_SHARE = None               # доля включений, при которой сравниваются модели; None — порог основной модели
 SCORE_BUCKETS = 10                 # на сколько равных групп по оценке модели делить договоры для винтажей
 BANKRUPTCY_COL = "bankruptcy_date" # дата банкротства в таблице транзакций; нет колонки — блок о сроках пропускается
 
@@ -546,7 +547,18 @@ def summary(mask):
 
 
 p_va, p_te = va["profit"].to_numpy(), te["profit"].to_numpy()
-mask_new, thr_new, share_val_new = policy(va["score_new"].to_numpy(), p_va, te["score_new"].to_numpy())
+def top_mask(score, k):
+    # k договоров с наибольшей оценкой
+    mask = np.zeros(len(score), bool)
+    mask[np.argsort(-np.asarray(score), kind="stable")[:k]] = True
+    return mask
+
+
+own_mask_new, thr_new, share_val_new = policy(va["score_new"].to_numpy(), p_va, te["score_new"].to_numpy())
+# сравнение моделей — при одной и той же доле включений: по умолчанию та, что даёт порог основной модели
+K_COMMON = int(round(len(te) * COMPARE_SHARE)) if COMPARE_SHARE else int(own_mask_new.sum())
+mask_new = top_mask(te["score_new"].to_numpy(), K_COMMON) if COMPARE_SHARE else own_mask_new
+SHARE_COMMON = K_COMMON / len(te)
 res = {"all": summary(np.ones(len(te), bool)), "new": summary(mask_new), "oracle": summary(p_te > 0)}
 T = len(te)
 per_1000 = res["new"]["profit"] / T * 1000
@@ -599,10 +611,14 @@ def captured(score, share):
     return money_te[np.argsort(-score, kind="stable")[:k]].sum() / money_te.sum()
 
 
+SHARE_GRID = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
 for m in models:
     sv, st = m["scores"]["va"], m["scores"]["te"]
-    m["mask"], m["thr"], _ = policy(sv, p_va, st)
+    m["own_mask"], m["thr"], _ = policy(sv, p_va, st)          # свой порог — только для справки
+    m["own_res"] = summary(m["own_mask"])
+    m["mask"] = mask_new if m is main else top_mask(st, K_COMMON)   # одинаковое число включений у всех
     m["res"] = summary(m["mask"])
+    m["grid"] = {q: p_te[top_mask(st, int(round(T * q)))].sum() for q in SHARE_GRID}
     m["boot"] = (p_te[idx] * m["mask"][idx]).sum(axis=1)
     m["ci"] = np.percentile(m["boot"], [5, 95])
     m["auc"] = cl.metrics.roc_auc(te["payoff"], st)
@@ -614,7 +630,8 @@ for m in models:
 other_models = models[1:]
 by_bucket, bucket_curves, bucket_conv = main["by_bucket"], main["curves"], main["conv"]
 OTHERS_TXT = ("" if not other_models else " Для сравнения: " + "; ".join(
-    f"«{m['name']}» — {signed(m['res']['profit'])}" for m in other_models) + ".")
+    f"«{m['name']}» — {signed(m['res']['profit'])}" for m in other_models)
+              + f" (при той же доле включений, {pct(SHARE_COMMON, 0)}).")
 
 
 def show_buckets(m):
@@ -1451,6 +1468,11 @@ md("""
 включаемся по тем, у кого она выше порога. Порог выбран на более ранних договорах — в точке,
 где суммарный результат (поступления минус пошлина) максимален, — и затем проверен на более поздних
 договорах, которых модель не видела.
+
+**Сравнение моделей — при одинаковой доле включений.** Порог подбирается по основной модели (или
+задаётся настройкой `COMPARE_SHARE`), и каждая модель отбирает одно и то же число договоров с
+наибольшей оценкой. Так разница между моделями показывает качество ранжирования, а не случайно
+разные пороги.
 """)
 code("""
 fig = go.Figure()
@@ -1459,17 +1481,21 @@ for i, m in enumerate(models):
     xs, ys = cum_curve(m["scores"]["te"])
     fig.add_scatter(x=xs, y=ys, mode="lines", name=name, line={"color": colr, "width": 2.5 if i == 0 else 2},
                     hovertemplate="%{x:.0%} договоров: %{y:.1f} млн ₽<extra>" + name + "</extra>")
-    k = int(mask.sum())
+    k = K_COMMON
     if k == 0:
         continue
     fig.add_scatter(x=[xs[k - 1]], y=[ys[k - 1]], mode="markers", showlegend=False,
                     marker={"color": colr, "size": 11, "line": {"color": "white", "width": 2}}, hoverinfo="skip")
     up = i % 2 == 0
     fig.add_annotation(x=xs[k - 1], y=ys[k - 1], ax=50 if up else 70, ay=(-42 - 14 * (i // 2)) if up else (58 + 14 * (i // 2)),
-                       text=f"порог: {pct(mask.mean(), 0)} договоров, {signed(ys[k - 1] * 1e6)}",
+                       text=f"{name}: {signed(ys[k - 1] * 1e6)}",
                        showarrow=True, arrowhead=0, arrowwidth=1, arrowcolor=INK2, standoff=8,
                        font={"color": INK, "size": 12}, bgcolor="white")
 fig.add_hline(y=0, line={"color": INK2, "width": 1})
+if K_COMMON:
+    fig.add_vline(x=SHARE_COMMON, line={"color": INK2, "width": 1, "dash": "dot"},
+                  annotation_text=f"порог: {pct(SHARE_COMMON, 0)} договоров", annotation_position="bottom right",
+                  annotation_font={"color": INK2, "size": 12})
 ZOOM = 0.6
 xs_new, ys_new = cum_curve(te["score_new"].to_numpy())
 y_lo = ys_new[int(ZOOM * T) - 1]
@@ -1600,8 +1626,10 @@ if other_models:
     display(Markdown(f\'\'\'
 ## 9. Сравнение моделей
 
-Все модели проверены одинаково: порог отбора выбран на более ранних договорах, результат посчитан на
-{num(T)} договорах, включённых {P_TEST}. Основная модель — «{MODEL_NAME}».
+Все модели сравниваются при одной и той же доле включений — {pct(SHARE_COMMON, 0)} договоров с наибольшей
+оценкой ({num(K_COMMON)} из {num(T)} договоров, включённых {P_TEST}). Основная модель — «{MODEL_NAME}».
+Строки «при своём пороге» — справочно: порог каждой модели, подобранный отдельно на ранних договорах;
+он зависит от случайных колебаний, поэтому по нему модели не сравниваются.
 \'\'\'))
     display(pd.DataFrame({
         m["name"]: {
@@ -1616,6 +1644,8 @@ if other_models:
             "доля денег в верхних 10 % по оценке": pct(m["top10"], 0),
             "доля денег в верхних 20 % по оценке": pct(m["top20"], 0),
             "совпадение отбора с основной моделью": pct(m["overlap"], 0),
+            "при своём пороге: доля включений": pct(m["own_res"]["share"], 0),
+            "при своём пороге: результат, млн ₽": signed(m["own_res"]["profit"]).replace(" млн ₽", ""),
         } for m in models}))
 """)
 code("""
@@ -1640,6 +1670,12 @@ if other_models:
 """)
 code("""
 if other_models:
+    display(Markdown("**Результат при разной доле включений, млн ₽** — одна и та же доля для всех моделей:"))
+    display(pd.DataFrame({m["name"]: {pct(q, 0): signed(v).replace(" млн ₽", "") for q, v in m["grid"].items()}
+                          for m in models}).rename_axis("включаемся по доле договоров"))
+""")
+code("""
+if other_models:
     best = max(models, key=lambda m: m["res"]["profit"])
     lines = []
     for m in other_models:
@@ -1650,8 +1686,8 @@ if other_models:
                      f"до {signed(hi)}; {sure}); отбор совпадает на {pct(m['overlap'], 0)}")
     steep = max(models, key=lambda m: m["by_bucket"]["recovery"].iloc[0] / max(m["by_bucket"]["recovery"].iloc[-1], 1e-9))
     display(Markdown(
-        f"> **Вывод.** Лучший результат на проверочных договорах — у модели «{best['name']}»: "
-        f"{signed(best['res']['profit'])}. " + ". ".join(lines) + ". "
+        f"> **Вывод.** При одинаковой доле включений ({pct(SHARE_COMMON, 0)}) лучший результат на проверочных "
+        f"договорах — у модели «{best['name']}»: {signed(best['res']['profit'])}. " + ". ".join(lines) + ". "
         f"Сильнее всего верхнюю и нижнюю группы разводит модель «{steep['name']}»: "
         f"{pct(steep['by_bucket']['recovery'].iloc[0])} против {pct(steep['by_bucket']['recovery'].iloc[-1])} долга."))
     for m in other_models:
