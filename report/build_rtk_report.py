@@ -45,6 +45,22 @@ RETRO_TO = None                    # договоры, включённые не
 OOT_FROM = "2024-01-01"            # с этой даты включения — проверочная выборка (модель её не видит)
 MIN_CONTRACTS = 100                # продукты с меньшим числом договоров на графики не выносятся
 SCORE_BUCKETS = 10                 # на сколько равных групп по оценке модели делить договоры для винтажей
+
+# Модель. По умолчанию отчёт обучает её сам. Чтобы применить готовую, задайте одно из двух:
+MODEL_PATH = None                  # файл обученной модели: .pkl (joblib, есть predict_proba) или .txt (LightGBM)
+SCORE_COL = None                   # либо колонка с уже посчитанной оценкой в таблице признаков
+MODEL_FEATURES_JSON = None         # features.json модели ("features", "cat_features"); None — взять из модели
+MODEL_TARGET = "договор вернёт больше 5 % долга за 2 года"   # что предсказывает готовая модель (для текста)
+
+
+def prepare_features(X, cat_features):
+    # Подготовка признаков перед применением готовой модели — как при её обучении.
+    # По умолчанию: категориальные -> category, остальные -> число. Переопределите в settings_local.py,
+    # если модель обучалась на данных, подготовленных иначе.
+    X = X.copy()
+    for c in X.columns:
+        X[c] = X[c].astype("category") if c in cat_features else pd.to_numeric(X[c], errors="coerce")
+    return X
 DUTY_SHARE = 0.5                   # доля имущественной пошлины: 0.5 — включение в реестр
 OVERHEAD = 0                       # ₽ на договор сверх пошлины (подготовка и подача заявления)
 
@@ -368,11 +384,71 @@ def fit(y_tr, y_va, rows_tr=None, rows_va=None, features=None):
                  cat_features=[c for c in cat_cols if c in features])
 
 
-model_new = fit(tr["payoff"], va["payoff"])
-model_old = fit(tr["old_target"], va["old_target"])
-for part in (tr, va, te):
-    part["score_new"] = model_new.predict(part[FEATURES])
-    part["score_old"] = model_old.predict(part[FEATURES])
+EXTERNAL = MODEL_PATH is not None or SCORE_COL is not None   # готовая модель: в отчёте не обучаем
+HAS_OLD = not EXTERNAL                                        # сравнение с текущим таргетом — только при обучении
+ext_model, ext_importance = None, None
+if SCORE_COL is not None:
+    require(base, [SCORE_COL], "признаки")
+    FEATURES = [c for c in FEATURES if c != SCORE_COL]
+    for part in (tr, va, te):
+        part["score_new"] = pd.to_numeric(part[SCORE_COL], errors="coerce")
+        if part["score_new"].isna().any():
+            raise ValueError(f"В колонке {SCORE_COL!r} есть пустые оценки")
+elif MODEL_PATH is not None:
+    import json
+
+    if str(MODEL_PATH).endswith(".txt"):
+        import lightgbm as lgb
+
+        ext_model = lgb.Booster(model_file=str(MODEL_PATH))
+        ext_features = ext_model.feature_name()
+    else:
+        import joblib
+
+        ext_model = joblib.load(MODEL_PATH)
+        ext_features = list(getattr(ext_model, "feature_name_", None)
+                            or getattr(ext_model, "feature_names_in_", []))
+    ext_cat = []
+    if MODEL_FEATURES_JSON is not None:
+        meta = json.loads(Path(MODEL_FEATURES_JSON).read_text(encoding="utf-8"))
+        ext_features = meta.get("features", ext_features)
+        ext_cat = meta.get("cat_features", [])
+    if not ext_features:
+        raise ValueError("Не удалось определить признаки модели — задайте MODEL_FEATURES_JSON")
+    source = agg.set_index("contract_number")              # исходные значения, до приведения типов
+    lacking = [c for c in ext_features if c not in source.columns and c not in base.columns]
+    if lacking:
+        raise ValueError(f"В таблице признаков нет колонок, нужных модели: {', '.join(lacking)}")
+    if not ext_cat:
+        ext_cat = [c for c in ext_features if c in source.columns and source[c].dtype == object]
+    for part in (tr, va, te):
+        raw_x = pd.DataFrame({c: (source[c].reindex(part["contract_number"]).to_numpy()
+                                  if c in source.columns else part[c].to_numpy())
+                              for c in ext_features}, index=part.index)
+        X = prepare_features(raw_x, ext_cat)
+        part["score_new"] = (ext_model.predict_proba(X)[:, 1] if hasattr(ext_model, "predict_proba")
+                             else ext_model.predict(X))
+    FEATURES = list(ext_features)
+    booster = getattr(ext_model, "booster_", ext_model)
+    if hasattr(booster, "feature_importance"):
+        ext_importance = pd.Series(booster.feature_importance(importance_type="gain"), index=ext_features,
+                                   dtype=float)
+else:
+    model_new = fit(tr["payoff"], va["payoff"])
+    model_old = fit(tr["old_target"], va["old_target"])
+    for part in (tr, va, te):
+        part["score_new"] = model_new.predict(part[FEATURES])
+        part["score_old"] = model_old.predict(part[FEATURES])
+
+# подписи: что за модель и как она названа в тексте
+P1 = "ранние договоры" if EXTERNAL else "обучение"
+if EXTERNAL:
+    MODEL_NAME, MODEL_GEN = "готовая модель", "готовой моделью"
+    MODEL_DESC = (f"Применяется готовая модель, в отчёте она не обучается. Она оценивает вероятность того, "
+                  f"что {MODEL_TARGET}.")
+else:
+    MODEL_NAME, MODEL_GEN = "новая модель", "новой моделью"
+    MODEL_DESC = "Она оценивает вероятность того, что поступления за 2 года превысят пошлину."
 
 
 def policy(score_va, profit_va, score_te):
@@ -393,24 +469,27 @@ def summary(mask):
 
 p_va, p_te = va["profit"].to_numpy(), te["profit"].to_numpy()
 mask_new, thr_new, share_val_new = policy(va["score_new"].to_numpy(), p_va, te["score_new"].to_numpy())
-mask_old, thr_old, _ = policy(va["score_old"].to_numpy(), p_va, te["score_old"].to_numpy())
-res = {"all": summary(np.ones(len(te), bool)), "old": summary(mask_old), "new": summary(mask_new),
-       "oracle": summary(p_te > 0)}
+res = {"all": summary(np.ones(len(te), bool)), "new": summary(mask_new), "oracle": summary(p_te > 0)}
+if HAS_OLD:
+    mask_old, thr_old, _ = policy(va["score_old"].to_numpy(), p_va, te["score_old"].to_numpy())
+    res["old"] = summary(mask_old)
 T = len(te)
 per_1000 = res["new"]["profit"] / T * 1000
-per_1000_txt = mln(per_1000, 1) if abs(per_1000) >= 1e6 else f"{num(per_1000 / 1000)} тыс ₽"
+per_1000_txt = (mln(per_1000, 1) if abs(per_1000) >= 1e6 else f"{num(per_1000 / 1000)} тыс ₽").replace("-", "−")
 
 # неопределённость: бутстреп по договорам проверочной выборки
 rng = np.random.default_rng(0)
 idx = rng.integers(0, T, size=(1000, T))
 boot_new = (p_te[idx] * mask_new[idx]).sum(axis=1)
-boot_diff = boot_new - (p_te[idx] * mask_old[idx]).sum(axis=1)
 ci_new = np.percentile(boot_new, [5, 95])
-ci_diff = np.percentile(boot_diff, [5, 95])
+if HAS_OLD:
+    ci_diff = np.percentile(boot_new - (p_te[idx] * mask_old[idx]).sum(axis=1), [5, 95])
+OLD_TXT = (f" Текущая модель (таргет «вернули больше 5 % долга») дала бы {signed(res['old']['profit'])}."
+           if HAS_OLD else "")
 
 # качество
 auc = {name: cl.metrics.roc_auc(d["payoff"], d["score_new"]) for name, d in
-       (("обучение", tr), ("настройка порога", va), ("проверка", te))}
+       ((P1, tr), ("настройка порога", va), ("проверка", te))}
 te["decile"] = pd.qcut(te["score_new"].rank(method="first", ascending=False), 10, labels=range(1, 11))
 dec_t = te.groupby("decile", observed=False).agg(
     n=("profit", "size"), payoff=("payoff", "mean"), money=("money", "mean"), duty=("duty", "mean"),
@@ -438,8 +517,11 @@ by_bucket["duty_avg"] = by_bucket["duty"] / by_bucket["n"]
 BUCKET_COLORS = seq_colors(B)[::-1]                    # высшая оценка — самый тёмный
 te_recovery = te["money"].sum() / te["rtk_balance"].sum()
 
-importance = model_new.feature_importance("gain")
-importance = (importance / importance.sum()).sort_values(ascending=False)
+importance = ext_importance if EXTERNAL else model_new.feature_importance("gain")
+if importance is not None and importance.sum() > 0:
+    importance = (importance / importance.sum()).sort_values(ascending=False)
+else:
+    importance = None
 
 
 def cum_curve(score):
@@ -468,8 +550,11 @@ for name, share, overhead in SCENARIOS:
         continue
     pr = {k: (d["money"] - cost(d["rtk_balance"], share, overhead)).to_numpy()
           for k, d in (("tr", tr), ("va", va), ("te", te))}
-    m = fit((pr["tr"] > 0).astype(int), (pr["va"] > 0).astype(int))
-    msk, _, _ = policy(m.predict(va[FEATURES]), pr["va"], m.predict(te[FEATURES]))
+    if EXTERNAL:                                   # готовая модель не переобучается — меняется только порог
+        msk, _, _ = policy(va["score_new"].to_numpy(), pr["va"], te["score_new"].to_numpy())
+    else:
+        m = fit((pr["tr"] > 0).astype(int), (pr["va"] > 0).astype(int))
+        msk, _, _ = policy(m.predict(va[FEATURES]), pr["va"], m.predict(te[FEATURES]))
     sens[name] = {"all": pr["te"].sum(), "new": pr["te"][msk].sum(), "share": msk.mean()}
 sens = pd.DataFrame(sens).T
 
@@ -486,7 +571,7 @@ by_product["share"] = by_product["take"] / by_product["n"]
 
 # общая модель против модели только по основному продукту (на его проверочных договорах)
 solo = None
-if MULTI:
+if MULTI and not EXTERNAL:
     r_tr, r_va, r_te = [(d["product"] == PRODUCT).to_numpy() for d in (tr, va, te)]
     solo_features = [c for c in FEATURES if c != PROD]
     m_solo = fit(tr["payoff"][r_tr], va["payoff"][r_va], r_tr, r_va, solo_features)
@@ -510,9 +595,9 @@ if res["all"]["profit"] < 0:
 else:
     MARGIN_TXT = (f"Включение по всем и так окупается; отбор добавляет к нему {signed(GAIN)} за счёт "
                   "отказа от договоров, которые пошлину не окупят.")
-NO_FEATURES_NOTE = (f"Модель построена по продуктам: {', '.join(model_products)}. По остальным "
+NO_FEATURES_NOTE = (f"Модель рассчитана по продуктам: {', '.join(model_products)}. По остальным "
                     f"({', '.join(no_feature_products)}) признаков в выгрузке нет."
-                    if no_feature_products else f"Модель построена по всем продуктам: {', '.join(model_products)}.")
+                    if no_feature_products else f"Модель рассчитана по всем продуктам: {', '.join(model_products)}.")
 others_econ = prod_econ.drop(index=PRODUCT)
 others_odd = others_econ[others_econ["money"] > others_econ["balance"]]   # поступлений больше, чем долга
 others_no_tx = others_econ[others_econ["tx"] == 0]
@@ -604,13 +689,13 @@ display(Markdown(f'''
    {num(base["money"].mean())} ₽. Пошлину окупают {pct(econ["payoff"].iloc[0], 0)} договоров, включённых
    {P_TRAIN}, и {pct(econ["payoff"].iloc[-1], 0)} — включённых {P_TEST}. По {num(T)} договорам
    проверочного периода включение по всем дало бы **{signed(res["all"]["profit"], 0)}**.
-7. **Модель отбирает договоры, по которым включение окупается.** Она оценивает вероятность того,
-   что поступления за 2 года превысят пошлину. Включаемся по {pct(res["new"]["share"], 0)} договоров с
+7. **Модель отбирает договоры, по которым включение окупается.** {MODEL_DESC}
+   Включаемся по {pct(res["new"]["share"], 0)} договоров с
    наибольшей оценкой — среди них пошлину окупают {pct(res["new"]["payoff"], 0)}, против
    {pct(res["all"]["payoff"], 0)} в среднем.
 8. **Результат на договорах проверочного периода: {signed(res["new"]["profit"])}** вместо
    {signed(res["all"]["profit"], 0)} — это {per_1000_txt} на каждую 1 000 рассмотренных договоров.
-   Текущая модель (таргет «вернули больше 5 % долга») дала бы {signed(res["old"]["profit"])}.
+  {OLD_TXT}
 9. **Откуда эффект и насколько он устойчив.** {MARGIN_TXT} При дополнительных 2 000 ₽ расходов
    на подачу результат отбора — {signed(sens["new"].iloc[1])} (вместо {signed(res["new"]["profit"])}).
    Оценка — сверху: все поступления считаются результатом включения.
@@ -997,7 +1082,21 @@ display(Markdown(f\'\'\'
 \'\'\'))
 """)
 
-md("""
+code("""
+if EXTERNAL:
+    intro = f'''
+## 7. Модель: какие договоры окупят пошлину
+
+**Что предсказывает.** В отчёте применяется готовая модель — здесь она не обучается. Модель оценивает
+вероятность того, что {MODEL_TARGET}. Ниже проверяется, насколько её оценка упорядочивает договоры по
+окупаемости пошлины.
+
+**Как проверена.** Договоры, включённые {P_TRAIN}, используются только для выбора порога отбора;
+результат считается на договорах, включённых {P_TEST}. Чтобы проверка была честной, проверочный
+период должен начинаться не раньше, чем заканчивается период обучения модели (настройка `OOT_FROM`).
+'''
+else:
+    intro = '''
 ## 7. Модель: какие договоры окупят пошлину
 
 **Что предсказывает.** Вероятность того, что поступления по договору за 2 года после включения
@@ -1008,18 +1107,22 @@ md("""
 **На чём обучена и как проверена.** Модель учится на более ранних договорах и проверяется на более
 поздних, которых не видела (периоды — в таблице ниже), — так же, как будет работать в жизни:
 решение по новым договорам на опыте прошлых.
-""")
-code("""
-parts = [("обучение", tr), ("настройка порога", va), ("проверка", te)]
+'''
+display(Markdown(intro))
+parts = [(P1, tr), ("настройка порога", va), ("проверка", te)]
 display(pd.DataFrame({
     "договоров": [num(len(d)) for _, d in parts],
     "период включения в РТК": [f"{d['rtk_send_date'].min():%d.%m.%Y} – {d['rtk_send_date'].max():%d.%m.%Y}" for _, d in parts],
     "окупили пошлину": [pct(d["payoff"].mean()) for _, d in parts],
     "качество ранжирования (AUC)": [dec(auc[k], 3) for k, _ in parts],
 }, index=pd.Index([k for k, _ in parts], name="выборка")))
+feat_txt = (f"Оценка взята из колонки `{SCORE_COL}` таблицы признаков." if SCORE_COL is not None else
+            f"Признаков у модели — {len(FEATURES)}: {', '.join(FEATURES[:12])}{'…' if len(FEATURES) > 12 else ''}."
+            if EXTERNAL else
+            f"Признаков — {len(FEATURES)}: сумма долга, просрочки по договору, имущество (автомобили, "
+            "недвижимость), кредиты в других банках, анкетные данные. Алгоритм — градиентный бустинг (LightGBM).")
 display(Markdown(f\'\'\'
-Признаков — {len(FEATURES)}: сумма долга, просрочки по договору, имущество (автомобили,
-недвижимость), кредиты в других банках, анкетные данные. Алгоритм — градиентный бустинг (LightGBM).
+{feat_txt}
 AUC — доля пар «окупился / не окупился», которые модель упорядочила правильно: 0,5 — случайно,
 1,0 — безошибочно.
 \'\'\'))
@@ -1056,7 +1159,7 @@ RU = {"rtk_balance": "сумма долга", "age": "возраст", "job_posi
       "realty_count": "число объектов недвижимости", "education_level_cd": "образование",
       "marital_status_cd": "семейное положение", "children_cnt": "число детей",
       "pensioner_flg": "пенсионер", "parent_financial_account_subtype_cd": "тип исходного продукта"}
-top = importance.head(12).iloc[::-1]
+top = (importance if importance is not None else pd.Series({"нет данных": 1.0})).head(12).iloc[::-1]
 top.index = [f"{RU[c]} ({c})  " if c in RU else f"{c}  " for c in top.index]
 fig = go.Figure(go.Bar(y=top.index, x=top.values, orientation="h", marker={"color": BLUE, "cornerradius": 4},
                        text=[pct(v, 0) for v in top.values], textposition="outside",
@@ -1067,16 +1170,19 @@ layout(fig, f"На что опирается модель: {top.index[-1].split(
 fig.update_layout(margin={"l": 330})
 fig.update_xaxes(showticklabels=False)
 fig.update_yaxes(showgrid=False)
-fig
+if importance is not None:
+    fig.show()
 """)
 code("""
 pos_groups = int((dec_t["profit"] > 0).sum())
+auc_txt = (f"Качество ранжирования на проверочных договорах — AUC {dec(auc['проверка'], 2)}." if EXTERNAL else
+           f"Качество на проверке (AUC {dec(auc['проверка'], 2)}) ниже, чем на обучении "
+           f"({dec(auc['обучение'], 2)}): модель умеренной силы, и главный резерв роста — новые признаки.")
 display(Markdown(f\'\'\'
 > **Вывод.** Модель упорядочивает договоры по окупаемости: в лучшей группе пошлину окупают
 > {pct(dec_t["payoff"].iloc[0], 0)} договоров, в худшей — {pct(dec_t["payoff"].iloc[-1], 0)}.
 > В среднем в плюс выходит {pos_groups} из 10 групп — включаться стоит по верхней части списка, а не
-> по большинству. Качество на проверке (AUC {dec(auc["проверка"], 2)}) ниже, чем на
-> обучении ({dec(auc["обучение"], 2)}): модель умеренной силы, и главный резерв роста — новые признаки.
+> по большинству. {auc_txt}
 \'\'\'))
 """)
 
@@ -1167,14 +1273,16 @@ md("""
 ## 8. Как отбираем договоры и сколько это даёт
 
 **Правило.** Для каждого нового договора модель считает оценку. Договоры упорядочиваются по оценке,
-включаемся по тем, у кого она выше порога. Порог выбран на договорах периода обучения — в точке,
+включаемся по тем, у кого она выше порога. Порог выбран на более ранних договорах — в точке,
 где суммарный результат (поступления минус пошлина) максимален, — и затем проверен на более поздних
 договорах, которых модель не видела.
 """)
 code("""
 fig = go.Figure()
-for name, col, colr, mask in [("новая модель: «окупит пошлину»", "score_new", BLUE, mask_new),
-                              ("текущая модель: «вернёт > 5 % долга»", "score_old", ORANGE, mask_old)]:
+curves = [(MODEL_NAME if EXTERNAL else "новая модель: «окупит пошлину»", "score_new", BLUE, mask_new)]
+if HAS_OLD:
+    curves.append(("текущая модель: «вернёт > 5 % долга»", "score_old", ORANGE, mask_old))
+for name, col, colr, mask in curves:
     xs, ys = cum_curve(te[col].to_numpy())
     fig.add_scatter(x=xs, y=ys, mode="lines", name=name, line={"color": colr, "width": 2.5},
                     hovertemplate="%{x:.0%} договоров: %{y:.1f} млн ₽<extra>" + name + "</extra>")
@@ -1202,14 +1310,17 @@ fig.update_yaxes(title_text="млн ₽", range=[y_lo - 1, ys_new.max() + 3])
 fig
 """)
 code("""
-names = {"all": "включаться по всем", "old": "отбор текущей моделью", "new": "отбор новой моделью"}
+names = {"all": "включаться по всем"}
+if HAS_OLD:
+    names["old"] = "отбор текущей моделью"
+names["new"] = f"отбор {MODEL_GEN}"
 vals = [res[k]["profit"] / 1e6 for k in names]
 fig = go.Figure(go.Bar(x=list(names.values()), y=vals, width=0.5,
                        marker={"color": [BLUE if v >= 0 else RED for v in vals], "cornerradius": 4},
                        text=[signed(v * 1e6) for v in vals], textposition="outside", cliponaxis=False,
                        textfont={"color": INK, "size": 14}, hovertemplate="%{x}: %{y:.1f} млн ₽<extra></extra>"))
 fig.add_hline(y=0, line={"color": INK2, "width": 1})
-layout(fig, f"Отбор новой моделью: {signed(res['new']['profit'])} вместо {signed(res['all']['profit'], 0)}",
+layout(fig, f"Отбор {MODEL_GEN}: {signed(res['new']['profit'])} вместо {signed(res['all']['profit'], 0)}",
        f"результат (поступления − пошлина) на {num(T)} договорах, включённых {P_TEST}, млн ₽", height=400)
 fig.update_yaxes(showticklabels=False, showgrid=False)
 fig
@@ -1224,11 +1335,13 @@ display(pd.DataFrame({
                "на 1 ₽ пошлины возвращается, ₽": dec(res[k]["money"] / res[k]["duty"], 2)}
     for k in names}))
 show_tiles([
-    (signed(res["new"]["profit"]), "результат отбора новой моделью",
+    (signed(res["new"]["profit"]), f"результат отбора {MODEL_GEN}",
      f"с вероятностью 90 % — от {signed(ci_new[0])} до {signed(ci_new[1])}"),
     (per_1000_txt, "на 1 000 рассмотренных договоров", "при потоке и качестве договоров как в проверочном периоде"),
-    (signed(res["new"]["profit"] - res["old"]["profit"]), "лучше текущей модели",
-     f"с вероятностью 90 % — от {signed(ci_diff[0])} до {signed(ci_diff[1])}"),
+    ((signed(res["new"]["profit"] - res["old"]["profit"]), "лучше текущей модели",
+      f"с вероятностью 90 % — от {signed(ci_diff[0])} до {signed(ci_diff[1])}") if HAS_OLD else
+     (pct(res["new"]["share"], 0), "договоров проходят отбор",
+      f"из них окупают пошлину {pct(res['new']['payoff'], 0)}")),
     (signed(res["oracle"]["profit"], 0), "потолок: безошибочный отбор",
      f"недостижим; показывает запас ({pct(res['oracle']['share'], 0)} договоров)"),
 ])
@@ -1269,23 +1382,25 @@ if MULTI:
     small = t.index[t["n"] < MIN_CONTRACTS].tolist()
     small_note = (f" По продуктам {', '.join(small)} на проверке меньше {MIN_CONTRACTS} договоров — "
                   f"цифры по ним ориентировочные." if small else "")
-    better = "общая модель" if solo["joint"] >= solo["solo"] else f"модель только по {PRODUCT}"
+    solo_txt = ""
+    if solo is not None:
+        better = "общая модель" if solo["joint"] >= solo["solo"] else f"модель только по {PRODUCT}"
+        solo_txt = (f" На {num(solo['n'])} проверочных договорах {PRODUCT}: общая модель — {signed(solo['joint'])}, "
+                    f"модель, обученная только на {PRODUCT}, — {signed(solo['solo'])}, включение по всем — "
+                    f"{signed(solo['all'])}; лучше {better}.")
     display(Markdown(f\'\'\'
 > **Вывод.** По всем продуктам вместе отбор даёт {signed(res["new"]["profit"])} против
-> {signed(res["all"]["profit"])} при включении по всем. На {num(solo["n"])} проверочных договорах
-> {PRODUCT}: общая модель — {signed(solo["joint"])}, модель, обученная только на {PRODUCT}, —
-> {signed(solo["solo"])}, включение по всем — {signed(solo["all"])}; лучше {better}.{small_note}
+> {signed(res["all"]["profit"])} при включении по всем.{solo_txt}{small_note}
 \'\'\'))
 else:
     display(Markdown(f"Модель построена по одному продукту ({PRODUCT}) — разбивки по продуктам нет."))
 """)
-md("""
-### Если затраты окажутся выше
-
-Пошлина — не единственный расход: возможны затраты на подготовку и подачу заявления. Под каждый
-сценарий модель обучена заново («окупит ли договор эти затраты»), порог подобран тем же способом.
-""")
 code("""
+display(Markdown("### Если затраты окажутся выше\\n\\nПошлина — не единственный расход: возможны затраты на "
+                 "подготовку и подачу заявления. " +
+                 ("Модель та же; под каждый сценарий заново подобран только порог отбора." if EXTERNAL else
+                  "Под каждый сценарий модель обучена заново («окупит ли договор эти затраты»), порог "
+                  "подобран тем же способом.")))
 display(pd.DataFrame({
     "включаться по всем, млн ₽": sens["all"].map(lambda v: signed(v, 0).replace(" млн ₽", "")),
     "отбор моделью, млн ₽": sens["new"].map(lambda v: signed(v).replace(" млн ₽", "")),
@@ -1293,9 +1408,9 @@ display(pd.DataFrame({
 }).rename_axis("затраты на включение"))
 worst = sens["new"].iloc[1:]
 display(Markdown(f\'\'\'
-> **Вывод.** На договорах проверочного периода отбор новой моделью даёт {signed(res["new"]["profit"])}
+> **Вывод.** На договорах проверочного периода отбор {MODEL_GEN} даёт {signed(res["new"]["profit"])}
 > ({per_1000_txt} на 1 000 рассмотренных договоров) против {signed(res["all"]["profit"], 0)} при
-> включении по всем и {signed(res["old"]["profit"])} у текущей модели. {MARGIN_TXT}
+> включении по всем.{OLD_TXT} {MARGIN_TXT}
 > Среди отобранных пошлину окупают {pct(res["new"]["payoff"], 0)} договоров: результат делают
 > немногие договоры с крупными поступлениями, поэтому он колеблется (интервал выше).
 > При более высоких затратах результат отбора — от {signed(worst.min())} до {signed(worst.max())}.
@@ -1307,6 +1422,15 @@ display(Markdown(f\'\'\'
 # ------------------------------------------------------------------ методика
 code("""
 neg = tx.loc[tx["transaction_amt"] < 0, "transaction_amt"].sum()
+if EXTERNAL:
+    model_note = (f"готовая, в отчёте не обучалась; предсказывает, что {MODEL_TARGET}. Результат считается "
+                  f"на договорах, включённых с {te['rtk_send_date'].min():%d.%m.%Y}.")
+    proto_note = ("Готовая модель применена как есть. Если проверочный период пересекается с периодом её "
+                  "обучения, результат завышен — начало проверки (`OOT_FROM`) должно быть не раньше конца обучения.")
+else:
+    model_note = (f"LightGBM, {len(FEATURES)} признаков на дату включения; обучение — договоры до "
+                  f"{tr['rtk_send_date'].max():%d.%m.%Y}, проверка — с {te['rtk_send_date'].min():%d.%m.%Y}.")
+    proto_note = "Модель в отчёте — рабочий прототип: параметры не подбирались, отбор признаков не проводился."
 late = df.loc[df["transaction_amt"].notna() & (df["tx_days"] > H), "transaction_amt"].sum()
 display(Markdown(f'''
 ## Как считали
@@ -1324,10 +1448,8 @@ display(Markdown(f'''
 - **Пошлина** — по действующему тарифу (50 % имущественной пошлины, ст. 333.21 НК РФ) от суммы
   долга на дату включения. **Результат** — поступления за 2 года минус пошлина.
 - **Другие продукты** — тот же расчёт поступлений и пошлины. {NO_FEATURES_NOTE}
-- **Модель** — LightGBM, {len(FEATURES)} признаков на дату включения; обучение — договоры до
-  {tr["rtk_send_date"].max():%d.%m.%Y}, проверка — с {te["rtk_send_date"].min():%d.%m.%Y}. Порог
-  отбора выбран на отложенной части договоров периода обучения, проверочная выборка в выборе не
-  участвовала.
+- **Модель** — {model_note} Порог отбора выбран на части более ранних договоров, проверочная
+  выборка в выборе не участвовала.
 - **Интервалы «с вероятностью 90 %»** — бутстреп по договорам проверочной выборки (1 000 повторов).
 
 **Что важно помнить**
@@ -1342,7 +1464,7 @@ display(Markdown(f'''
   для остальных. В расчёте это не учтено (признака в данных нет).
 - Новые договоры возвращают меньше прежних (раздел 4), поэтому порог нужно регулярно сверять по
   свежим созревшим договорам.
-- Модель в отчёте — рабочий прототип: параметры не подбирались, отбор признаков не проводился.
+- {proto_note}
   Когда решение будет приниматься по модели, данные для переобучения появятся только по отобранным
   договорам — для честной оценки нужна небольшая случайная контрольная группа.
 '''))
