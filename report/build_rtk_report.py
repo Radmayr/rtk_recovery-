@@ -45,6 +45,7 @@ RETRO_TO = None                    # договоры, включённые не
 OOT_FROM = "2024-01-01"            # с этой даты включения — проверочная выборка (модель её не видит)
 MIN_CONTRACTS = 100                # продукты с меньшим числом договоров на графики не выносятся
 SCORE_BUCKETS = 10                 # на сколько равных групп по оценке модели делить договоры для винтажей
+BANKRUPTCY_COL = "bankruptcy_date" # дата банкротства в таблице транзакций; нет колонки — блок о сроках пропускается
 
 # Модель. По умолчанию отчёт обучает её сам. Чтобы применить готовую, задайте одно из двух:
 MODEL_PATH = None                  # файл обученной модели: .pkl (joblib, есть predict_proba) или .txt (LightGBM)
@@ -214,6 +215,17 @@ BAL_LABELS = ["до 50 тыс", "50–100 тыс", "100–200 тыс", "200–30
 contracts["bal_group"] = pd.cut(contracts["rtk_balance"], [0, 50e3, 100e3, 200e3, 300e3, np.inf],
                                 labels=BAL_LABELS)
 
+# срок от даты банкротства до включения в РТК, дней
+HAS_WAIT = BANKRUPTCY_COL in df.columns
+if HAS_WAIT:
+    b_date = pd.to_datetime(df.drop_duplicates("contract_number")[BANKRUPTCY_COL], format="mixed",
+                            errors="coerce").dt.normalize()
+    contracts["wait"] = (contracts["rtk_send_date"] - b_date).dt.days
+    wait = contracts["wait"].dropna()
+    WAIT_LABELS = ["до 14 дней", "15–21", "22–30", "31–45", "свыше 45"]
+    contracts["wait_group"] = pd.cut(contracts["wait"], [-np.inf, 14, 21, 30, 45, np.inf], labels=WAIT_LABELS)
+    HAS_WAIT = len(wait) > 0
+
 N = len(contracts)
 BALANCE = contracts["rtk_balance"].sum()
 MONEY = contracts["money"].sum()
@@ -268,6 +280,11 @@ by_cohort = contracts.groupby("cohort").agg(
     n=("money", "size"), balance=("rtk_balance", "sum"), money=("money", "sum"), paid=("paid", "mean"))
 by_cohort["recovery"] = by_cohort["money"] / by_cohort["balance"]
 cohorts = by_cohort.index.tolist()
+if HAS_WAIT:
+    wait_q = contracts.groupby("cohort")["wait"].quantile([0.5, 0.9]).unstack()
+    by_wait = contracts.groupby("wait_group", observed=False).agg(
+        n=("money", "size"), balance=("rtk_balance", "sum"), money=("money", "sum"), paid=("paid", "mean"))
+    by_wait["recovery"] = by_wait["money"] / by_wait["balance"]
 by_year = contracts.groupby(contracts["rtk_send_date"].dt.year).agg(
     balance=("rtk_balance", "sum"), money=("money", "sum"), paid=("paid", "mean"))
 by_year["recovery"] = by_year["money"] / by_year["balance"]
@@ -909,7 +926,77 @@ display(Markdown(f'''
 
 # ------------------------------------------------------------------ 5. контекст
 md("""
-## 5. Контекст: поток договоров и другие продукты
+## 5. Контекст: сроки подачи, поток договоров и другие продукты
+""")
+code("""
+if HAS_WAIT:
+    W_MED, W_P90, W_MAX = wait.median(), wait.quantile(0.9), wait.max()
+    CAP = int(max(45, min(90, np.ceil(wait.quantile(0.995) / 5) * 5)))        # правая граница графика
+    hist = wait.clip(lower=0, upper=CAP).round().astype(int).value_counts().reindex(range(0, CAP + 1), fill_value=0)
+    late_share = (wait > CAP).mean()
+    fig = go.Figure(go.Bar(x=hist.index, y=hist.values, marker={"color": BLUE}, width=0.85,
+                           hovertemplate="%{x} дн.: %{y:,} договоров<extra></extra>"))
+    for v, label, pos in [(W_MED, f"половина — за {num(W_MED)} дн.", "top left"),
+                          (W_P90, f"90 % — за {num(W_P90)} дн.", "top right")]:
+        fig.add_vline(x=v, line={"color": INK2, "width": 1, "dash": "dot"}, annotation_text=label,
+                      annotation_position=pos, annotation_font={"color": INK, "size": 12})
+    layout(fig, f"От банкротства до включения в РТК — обычно {num(wait.quantile(0.25))}–{num(wait.quantile(0.75))} дней",
+           f"распределение договоров {PRODUCT} по числу дней от даты банкротства до включения в РТК"
+           + (f"; последний столбец — {CAP} дней и больше ({pct(late_share)} договоров)" if late_share > 0 else ""),
+           height=400, bargap=0.1)
+    fig.update_xaxes(title_text="дней от даты банкротства до включения в РТК", dtick=5)
+    fig.update_yaxes(title_text="договоров")
+    fig.show()
+else:
+    display(Markdown(f"*В таблице транзакций нет колонки `{BANKRUPTCY_COL}` — срок от банкротства до включения не считался.*"))
+""")
+code("""
+if HAS_WAIT:
+    fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.08, column_widths=[0.4, 0.3, 0.3], subplot_titles=[
+        "срок по кварталам включения, дней", "доля возврата за 2 года", "доля договоров с платежом"])
+    for name, col, colr in [("половина договоров", 0.5, BLUE), ("90 % договоров", 0.9, "#b7d3f6")]:
+        fig.add_bar(x=wait_q.index, y=wait_q[col], name=name, row=1, col=1, marker={"color": colr, "cornerradius": 4},
+                    text=[num(v) for v in wait_q[col]], textposition="outside", cliponaxis=False,
+                    textfont={"color": INK, "size": 11}, hovertemplate="%{x}: %{y:.0f} дн.<extra>" + name + "</extra>")
+    for j, (col, d) in enumerate([("recovery", 1), ("paid", 0)], start=2):
+        fig.add_bar(x=by_wait.index.astype(str), y=by_wait[col], row=1, col=j, showlegend=False,
+                    marker={"color": BLUE, "cornerradius": 4}, text=[pct(v, d) for v in by_wait[col]],
+                    textposition="outside", cliponaxis=False, textfont={"color": INK, "size": 11},
+                    customdata=by_wait["n"], hovertemplate="%{x}: %{text}<br>договоров: %{customdata:,}<extra></extra>")
+    layout(fig, "Срок подачи по кварталам и возврат в зависимости от срока",
+           "слева — за сколько дней включались; справа — итог за 2 года по группам срока от банкротства до включения",
+           height=430, top=120, barmode="group", bargap=0.25,
+           legend={"orientation": "h", "y": -0.2, "x": 0})
+    fig.update_yaxes(showticklabels=False, showgrid=False)
+    fig.update_xaxes(tickangle=-30)
+    fig.update_annotations(font={"size": 13, "color": INK2})
+    fig.show()
+    t = by_wait
+    display(pd.DataFrame({
+        "договоров": t["n"].map(num), "доля договоров": (t["n"] / t["n"].sum()).map(lambda v: pct(v)),
+        "долг, млн ₽": (t["balance"] / 1e6).map(lambda v: dec(v, 0)),
+        "поступления, млн ₽": (t["money"] / 1e6).map(lambda v: dec(v, 1)),
+        "доля возврата": t["recovery"].map(pct), "с платежом": t["paid"].map(lambda v: pct(v, 0)),
+    }).rename_axis("срок от банкротства до включения"))
+    neg_wait = int((wait < 0).sum())
+    q_first, q_last = wait_q.iloc[0], wait_q.iloc[-1]
+    trend = ("вырос" if q_last[0.5] > q_first[0.5] else "сократился" if q_last[0.5] < q_first[0.5] else "не изменился")
+    trend_txt = (f"Типичный срок {trend}: с {num(q_first[0.5])} дней в {wait_q.index[0]} до {num(q_last[0.5])} в {wait_q.index[-1]}."
+                 if trend != "не изменился" else f"Типичный срок не менялся: {num(q_first[0.5])} дней.")
+    fast, slow = by_wait.iloc[0], by_wait.iloc[-1]
+    neg_txt = f" У {num(neg_wait)} договоров включение раньше даты банкротства — их стоит проверить в данных." if neg_wait else ""
+    display(Markdown(f\'\'\'
+> **Вывод.** Половина договоров попадает в реестр за {num(W_MED)} дней
+> после даты банкротства, 90 % — за {num(W_P90)} дн., дольше 60 дней — {pct((wait > 60).mean())} договоров
+> (самый долгий случай — {num(W_MAX)} дней). {trend_txt} По группам срока доля возврата — от
+> {pct(by_wait["recovery"].min())} до {pct(by_wait["recovery"].max())}: у включённых в первые 14 дней —
+> {pct(fast["recovery"])}, у включённых позже 45 дней — {pct(slow["recovery"])}. Это сравнение групп, а не
+> эффект срока: срок подачи менялся от квартала к кварталу одновременно с самим возвратом (раздел 4),
+> и договоры с долгой подачей могут отличаться по другим причинам.{neg_txt}
+\'\'\'))
+""")
+md("""
+### Поток договоров и другие продукты
 """)
 code("""
 x = flow.index.to_timestamp()
