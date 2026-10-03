@@ -1,9 +1,12 @@
-"""Выполняет report/rtk_report.ipynb и сохраняет результат в report/out/.
+"""Выполняет ноутбук из report/ и сохраняет результат в report/out/.
 
-    python report/run_report.py                      # настройки — из ноутбука и settings_local.py
+    python report/run_report.py                      # отчёт; настройки — из ноутбука и settings_local.py
     python report/run_report.py --settings my.py     # другой файл настроек
+    python report/run_report.py --name v2            # другое имя файлов, чтобы не затереть прежние
+    python report/run_report.py --notebook cutoff    # подбор порога по оценкам из отчёта
 
-Результат: out/rtk_report.html (без кода, для показа) и out/rtk_report_executed.ipynb.
+Результат: out/<имя>.html (без кода, для показа) и out/<имя>_executed.ipynb; отчёт сохраняет
+ещё out/<имя>_scores.csv — оценки моделей по договорам для подбора порога.
 """
 
 import argparse
@@ -25,14 +28,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--settings", help="файл настроек вместо settings_local.py")
     parser.add_argument("--out", default=str(HERE / "out"), help="папка для результата")
-    parser.add_argument("--name", default="rtk_report", help="имя файлов результата")
+    parser.add_argument("--name", help="имя файлов результата (по умолчанию — имя ноутбука)")
+    parser.add_argument("--notebook", default="rtk_report", help="какой ноутбук выполнить: rtk_report или cutoff")
     args = parser.parse_args()
+    args.name = args.name or args.notebook
+    os.environ["RTK_REPORT_OUT"] = str(Path(args.out).resolve())
+    os.environ["RTK_REPORT_NAME"] = args.name
     if args.settings:
         os.environ["RTK_REPORT_SETTINGS"] = str(Path(args.settings).resolve())
 
-    nb = nbformat.read(HERE / "rtk_report.ipynb", as_version=4)
+    nb = nbformat.read(HERE / f"{args.notebook}.ipynb", as_version=4)
     started = time.time()
-    print("выполняю отчёт…")
+    print(f"выполняю {args.notebook}…")
     ExecutePreprocessor(timeout=None, kernel_name="python3").preprocess(
         nb, {"metadata": {"path": str(HERE)}})
 

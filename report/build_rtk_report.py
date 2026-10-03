@@ -1806,6 +1806,19 @@ display(pd.DataFrame({
 }).rename_axis("продукт"))
 """)
 
+code("""
+# оценки моделей по договорам — исходные данные для подбора порога (cutoff.ipynb)
+cols = ["contract_number", "product", "rtk_send_date", "rtk_balance", "money", "duty", "profit", "payoff"]
+scores = pd.concat([d[cols].assign(sample=k) for k, d in (("train", tr), ("val", va), ("test", te))],
+                   ignore_index=True)
+for m in models:
+    scores["score__" + m["name"]] = np.concatenate([m["scores"][k] for k in ("tr", "va", "te")])
+scores_path = (Path(os.environ.get("RTK_REPORT_OUT", "out"))
+               / (os.environ.get("RTK_REPORT_NAME", "rtk_report") + "_scores.csv"))
+scores_path.parent.mkdir(parents=True, exist_ok=True)
+scores.to_csv(scores_path, index=False, encoding="utf-8-sig")
+""")
+
 nb = nbf.v4.new_notebook(cells=cells)
 nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
 nb.metadata["title"] = "Включение в РТК: поступления, модель отбора, эффект"
